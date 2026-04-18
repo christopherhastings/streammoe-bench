@@ -11,7 +11,9 @@
 
 ---
 
-## Measured TTFT improvements (Q4_K_XL, M4 Max 48 GB, N=3)
+## Measured TTFT improvements (M4 Max 48 GB, N=3)
+
+### Q4_K_XL (18 GiB sidecar — fits in RAM)
 
 | Config            | Cold TTFT (s) | Warm p50 (s) | RSS (GiB) |
 |-------------------|--------------:|-------------:|----------:|
@@ -19,9 +21,20 @@
 | +L1 eager         |         1.061 |        0.191 |      6.91 |
 | +L1+L2+L3+L4 full |         1.087 |        0.198 |      7.01 |
 
-**Cold TTFT: 38% reduction. Warm p50: 32% reduction.** Layer 1 captures the bulk; Layers 2/3 are insurance for keep-warm; Layer 4 (now opt-in only) helps on long prompts.
+**Cold TTFT: 38 % reduction. Warm p50: 32 % reduction.** Layer 1 captures the bulk.
 
-BF16 numbers blocked by `--ngl 99` Metal allocation refusal — see Safeguards below.
+### BF16 (60 GiB sidecar — exceeds RAM, sb=128)
+
+| Config            | Cold TTFT (s) | Warm p50 (s) | RSS (GiB) |
+|-------------------|--------------:|-------------:|----------:|
+| baseline          |         3.633 |        0.672 |     18.63 |
+| +L1 eager         |         3.657 |        0.675 |     18.63 |
+| +L1+L2 warmup     |         3.571 |        0.605 |     18.90 |
+| +L1+L2+L3+L4 full |         3.506 |        0.998 |     18.88 |
+
+**L1 is a no-op on BF16** (sidecar evicts from page cache before first prompt). **L2 alone gives a 10 % warm-p50 win.** **L3 regresses warm p50** (heartbeat steals Metal queue time during measurement; needs pause-on-activity gate — see streammoe-bench/RESULTS.md "Known issues").
+
+**Recommended config:** `--streammoe-warmup` alone on BF16; full stack on Q4.
 
 ---
 

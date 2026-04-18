@@ -57,6 +57,14 @@ class ModelSpec:
     name: str
     gguf: str
     sidecar: str
+    # Per-model --moe-slot-bank. On the 48 GiB M4 Max, BF16 at slot-bank 256
+    # overcommits Metal (40 layers × 1.5 GiB/layer = 60 GiB > device budget)
+    # and the fork's --fit aborts with "n_gpu_layers already set by user".
+    # sb=128 was the value the pre-patch smoke test used successfully on BF16.
+    slot_bank: int = 256
+    # Some configs need CPU-only offload to fit in device memory at all.
+    # When ngl < all-layers, n_gpu_layers is explicit and --fit won't touch it.
+    n_gpu_layers: int = 99
 
 
 MODELS = [
@@ -64,11 +72,15 @@ MODELS = [
         name="q4_k_xl",
         gguf="/Users/christopherhastings/Downloads/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
         sidecar="/Users/claude/streammoe/models/qwen35-35b-sidecar",
+        slot_bank=256,
+        n_gpu_layers=99,
     ),
     ModelSpec(
         name="bf16",
         gguf="/Users/christopherhastings/Downloads/qwen36-bf16/BF16/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf",
         sidecar="/Users/claude/streammoe/models/qwen36-bf16-sidecar",
+        slot_bank=128,
+        n_gpu_layers=99,
     ),
 ]
 
@@ -114,8 +126,8 @@ def start_server(binary: str, model: ModelSpec, cfg: ConfigLayers,
         "-m", model.gguf,
         "--moe-sidecar", model.sidecar,
         "--moe-mode", "slot-bank",
-        "--moe-slot-bank", "256",
-        "-ngl", "99",
+        "--moe-slot-bank", str(model.slot_bank),
+        "-ngl", str(model.n_gpu_layers),
         "--host", "127.0.0.1",
         "--port", str(port),
         "-c", "4096",
@@ -177,7 +189,8 @@ def measure_ttft(port: int, prompt: str, timeout_s: float = 60.0) -> float:
 # Driver
 # --------------------------------------------------------------------------- #
 
-def run_matrix(binary: str, output_dir: Path, n_iter: int, prompt: str) -> dict:
+def run_matrix(binary: str, output_dir: Path, n_iter: int, prompt: str,
+               only_models: list = None) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {"generated_at": time.time(), "binary": binary, "runs": []}
     # Incremental checkpoint path — gets overwritten after every cell so a
@@ -187,7 +200,8 @@ def run_matrix(binary: str, output_dir: Path, n_iter: int, prompt: str) -> dict:
     def save_checkpoint():
         checkpoint.write_text(json.dumps(results, indent=2))
 
-    for model in MODELS:
+    selected = [m for m in MODELS if (only_models is None or m.name in only_models)]
+    for model in selected:
         if not os.path.exists(model.gguf):
             print(f"[skip] {model.name}: {model.gguf} missing", file=sys.stderr)
             continue
@@ -249,10 +263,12 @@ def main() -> int:
     ap.add_argument("--output-dir", default="./ttft-results")
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--prompt", default="Briefly: what is 2+2?")
+    ap.add_argument("--models", default="", help="comma-separated subset (e.g. 'bf16'); empty = all")
     args = ap.parse_args()
 
     out = Path(args.output_dir)
-    results = run_matrix(args.binary, out, args.iters, args.prompt)
+    only = [m.strip() for m in args.models.split(",") if m.strip()] or None
+    results = run_matrix(args.binary, out, args.iters, args.prompt, only_models=only)
     result_path = out / f"ttft_matrix_{int(time.time())}.json"
     result_path.write_text(json.dumps(results, indent=2))
     print(f"\nResults written to {result_path}")
