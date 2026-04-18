@@ -67,7 +67,7 @@ MODELS = [
     ),
     ModelSpec(
         name="bf16",
-        gguf="/Users/christopherhastings/Downloads/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf",
+        gguf="/Users/christopherhastings/Downloads/qwen36-bf16/BF16/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf",
         sidecar="/Users/claude/streammoe/models/qwen36-bf16-sidecar",
     ),
 ]
@@ -78,12 +78,27 @@ MODELS = [
 # --------------------------------------------------------------------------- #
 
 def wait_for_port(port: int, deadline: float) -> bool:
+    """Two-stage readiness: socket accepts + /streammoe/status returns ok:true.
+
+    Without the status probe we get HTTP 503 on the first /v1/completions
+    because llama-server starts listening immediately but populates its
+    model + slot state later. The status endpoint flips ok only when
+    ctx_http.is_ready.store(true) has been called after model load."""
+    status_url = f"http://127.0.0.1:{port}/streammoe/status"
     while time.monotonic() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                return True
+                pass
         except OSError:
-            time.sleep(0.1)
+            time.sleep(0.1); continue
+        # Stage 2: /streammoe/status says ok.
+        try:
+            with urllib.request.urlopen(status_url, timeout=2.0) as resp:
+                if resp.status == 200 and json.loads(resp.read()).get("ok") is True:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.5)
     return False
 
 
@@ -173,7 +188,9 @@ def run_matrix(binary: str, output_dir: Path, n_iter: int, prompt: str) -> dict:
 
             t_start = time.perf_counter()
             proc = start_server(binary, model, cfg, port, log_path)
-            ready = wait_for_port(port, deadline=time.monotonic() + 300)
+            # BF16 can take several minutes to mmap + eager-load a 60 GiB sidecar.
+            load_deadline = 900 if model.name == "bf16" else 360
+            ready = wait_for_port(port, deadline=time.monotonic() + load_deadline)
             startup_s = time.perf_counter() - t_start
             if not ready:
                 print(f"[error] server for {cfg.name}/{model.name} did not come up", file=sys.stderr)
