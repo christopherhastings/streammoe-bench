@@ -1,0 +1,8 @@
+ttft-results/
+quality-results/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+streammoe-app/.build/
+streammoe-app/.swiftpm/
