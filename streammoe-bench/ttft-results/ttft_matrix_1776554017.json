@@ -1,0 +1,402 @@
+{
+  "generated_at": 1776553648.333202,
+  "binary": "/Users/claude/streammoe/anemll-flash-llama.cpp/build/bin/llama-server",
+  "runs": [
+    {
+      "model": "qwen36",
+      "model_label": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+      "config": "baseline",
+      "production_flags": [
+        "--moe-sidecar",
+        "/Users/claude/streammoe/models/qwen35-35b-sidecar",
+        "--moe-mode",
+        "slot-bank",
+        "--moe-slot-bank",
+        "256",
+        "--moe-prefetch-temporal",
+        "--ctx-size",
+        "4096",
+        "--flash-attn",
+        "on"
+      ],
+      "layer_flags": [],
+      "startup_s": 13.181519208000282,
+      "rss_bytes": 9403465728,
+      "cold": [
+        {
+          "ttft_s": 2.1381632500006162,
+          "decode_tokps": 8.16738719892766,
+          "total_s": 4.097174083000027,
+          "tokens": 17
+        }
+      ],
+      "warm": [
+        {
+          "ttft_s": 0.29878179199931765,
+          "decode_tokps": 38.94320714461122,
+          "total_s": 0.7096364999997604,
+          "tokens": 17
+        },
+        {
+          "ttft_s": 0.3678154999997787,
+          "decode_tokps": 35.77474543337382,
+          "total_s": 0.815058374999353,
+          "tokens": 17
+        }
+      ],
+      "cold_ttft_p50": 2.1381632500006162,
+      "warm_ttft_p50": 0.33329864599954817,
+      "cold_decode_tokps": 8.16738719892766,
+      "warm_decode_tokps": 37.35897628899252
+    },
+    {
+      "model": "qwen36",
+      "model_label": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+      "config": "L1_eager",
+      "production_flags": [
+        "--moe-sidecar",
+        "/Users/claude/streammoe/models/qwen35-35b-sidecar",
+        "--moe-mode",
+        "slot-bank",
+        "--moe-slot-bank",
+        "256",
+        "--moe-prefetch-temporal",
+        "--ctx-size",
+        "4096",
+        "--flash-attn",
+        "on"
+      ],
+      "layer_flags": [
+        "--moe-eager-load"
+      ],
+      "startup_s": 18.968909291999807,
+      "rss_bytes": 8942960640,
+      "cold": [
+        {
+          "ttft_s": 1.2388710840004933,
+          "decode_tokps": 17.572916620904316,
+          "total_s": 2.14936308400047,
+          "tokens": 17
+        }
+      ],
+      "warm": [
+        {
+          "ttft_s": 0.2489464999998745,
+          "decode_tokps": 31.13516627032419,
+          "total_s": 0.7628348749994984,
+          "tokens": 17
+        },
+        {
+          "ttft_s": 0.3124805839997862,
+          "decode_tokps": 36.1436461718166,
+          "total_s": 0.7551586670006145,
+          "tokens": 17
+        }
+      ],
+      "cold_ttft_p50": 1.2388710840004933,
+      "warm_ttft_p50": 0.28071354199983034,
+      "cold_decode_tokps": 17.572916620904316,
+      "warm_decode_tokps": 33.639406221070395
+    },
+    {
+      "model": "qwen36",
+      "model_label": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+      "config": "L1L2_warmup",
+      "production_flags": [
+        "--moe-sidecar",
+        "/Users/claude/streammoe/models/qwen35-35b-sidecar",
+        "--moe-mode",
+        "slot-bank",
+        "--moe-slot-bank",
+        "256",
+        "--moe-prefetch-temporal",
+        "--ctx-size",
+        "4096",
+        "--flash-attn",
+        "on"
+      ],
+      "layer_flags": [
+        "--moe-eager-load",
+        "--streammoe-warmup"
+      ],
+      "startup_s": 17.9167714160003,
+      "rss_bytes": 9407365120,
+      "cold": [
+        {
+          "ttft_s": 1.1777557909999814,
+          "decode_tokps": 18.49001128682377,
+          "total_s": 2.043087874999401,
+          "tokens": 17
+        }
+      ],
+      "warm": [
+        {
+          "ttft_s": 0.2499764160002087,
+          "decode_tokps": 32.72896677860837,
+          "total_s": 0.738839999999982,
+          "tokens": 17
+        },
+        {
+          "ttft_s": 0.333066625000356,
+          "decode_tokps": 38.00199748002071,
+          "total_s": 0.7540971250000439,
+          "tokens": 17
+        }
+      ],
+      "cold_ttft_p50": 1.1777557909999814,
+      "warm_ttft_p50": 0.29152152050028235,
+      "cold_decode_tokps": 18.49001128682377,
+      "warm_decode_tokps": 35.36548212931454
+    },
+    {
+      "model": "qwen36",
+      "model_label": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+      "config": "L1L2L3L4_full",
+      "production_flags": [
+        "--moe-sidecar",
+        "/Users/claude/streammoe/models/qwen35-35b-sidecar",
+        "--moe-mode",
+        "slot-bank",
+        "--moe-slot-bank",
+        "256",
+        "--moe-prefetch-temporal",
+        "--ctx-size",
+        "4096",
+        "--flash-attn",
+        "on"
+      ],
+      "layer_flags": [
+        "--moe-eager-load",
+        "--streammoe-warmup",
+        "--moe-keep-warm",
+        "60"
+      ],
+      "startup_s": 17.920594708999488,
+      "rss_bytes": 9472671744,
+      "cold": [
+        {
+          "ttft_s": 1.2116882080008509,
+          "decode_tokps": 18.149065635524888,
+          "total_s": 2.093276292000155,
+          "tokens": 17
+        }
+      ],
+      "warm": [
+        {
+          "ttft_s": 0.25440912500016566,
+          "decode_tokps": 24.446509369807483,
+          "total_s": 0.9088992919996599,
+          "tokens": 17
+        },
+        {
+          "ttft_s": 0.3689647500004867,
+          "decode_tokps": 27.66686214399712,
+          "total_s": 0.9472739170005298,
+          "tokens": 17
+        }
+      ],
+      "cold_ttft_p50": 1.2116882080008509,
+      "warm_ttft_p50": 0.31168693750032617,
+      "cold_decode_tokps": 18.149065635524888,
+      "warm_decode_tokps": 26.0566857569023
+    },
+    {
+      "model": "qwen36bf16",
+      "model_label": "Qwen3.6-35B-A3B-BF16",
+      "config": "baseline",
+      "production_flags": [
+        "--moe-sidecar",
+        "/Users/claude/streammoe/models/qwen36-bf16-sidecar",
+        "--moe-mode",
+        "slot-bank",
+        "--moe-slot-bank",
+        "128",
+        "--moe-prefetch-temporal",
+        "--ctx-size",
+        "4096",
+        "--flash-attn",
+        "on"
+      ],
+      "layer_flags": [],
+      "startup_s": 41.345045582999774,
+      "rss_bytes": 24899387392,
+      "cold": [
+        {
+          "ttft_s": 3.566802290999476,
+          "decode_tokps": 5.021878781623147,
+          "total_s": 6.752860874999897,
+          "tokens": 17
+        }
+      ],
+      "warm": [
+        {
+          "ttft_s": 0.3498490829997536,
+          "decode_tokps": 21.44130459617285,
+          "total_s": 1.0960723329999382,
+          "tokens": 17
+        },
+        {
+          "ttft_s": 0.4113447499994436,
+          "decode_tokps": 22.41181999386295,
+          "total_s": 1.1252537499995015,
+          "tokens": 17
+        }
+      ],
+      "cold_ttft_p50": 3.566802290999476,
+      "warm_ttft_p50": 0.3805969164995986,
+      "cold_decode_tokps": 5.021878781623147,
+      "warm_decode_tokps": 21.9265622950179
+    },
+    {
+      "model": "qwen36bf16",
+      "model_label": "Qwen3.6-35B-A3B-BF16",
+      "config": "L1_eager",
+      "production_flags": [
+        "--moe-sidecar",
+        "/Users/claude/streammoe/models/qwen36-bf16-sidecar",
+        "--moe-mode",
+        "slot-bank",
+        "--moe-slot-bank",
+        "128",
+        "--moe-prefetch-temporal",
+        "--ctx-size",
+        "4096",
+        "--flash-attn",
+        "on"
+      ],
+      "layer_flags": [
+        "--moe-eager-load"
+      ],
+      "startup_s": 59.2544916249999,
+      "rss_bytes": 24909643776,
+      "cold": [
+        {
+          "ttft_s": 3.512603290999323,
+          "decode_tokps": 4.910206013082231,
+          "total_s": 6.771122374999322,
+          "tokens": 17
+        }
+      ],
+      "warm": [
+        {
+          "ttft_s": 0.3744568749998507,
+          "decode_tokps": 21.51231580078748,
+          "total_s": 1.1182168750001438,
+          "tokens": 17
+        },
+        {
+          "ttft_s": 0.42101412500051083,
+          "decode_tokps": 21.215423891089998,
+          "total_s": 1.175182417000542,
+          "tokens": 17
+        }
+      ],
+      "cold_ttft_p50": 3.512603290999323,
+      "warm_ttft_p50": 0.39773550000018076,
+      "cold_decode_tokps": 4.910206013082231,
+      "warm_decode_tokps": 21.363869845938737
+    },
+    {
+      "model": "qwen36bf16",
+      "model_label": "Qwen3.6-35B-A3B-BF16",
+      "config": "L1L2_warmup",
+      "production_flags": [
+        "--moe-sidecar",
+        "/Users/claude/streammoe/models/qwen36-bf16-sidecar",
+        "--moe-mode",
+        "slot-bank",
+        "--moe-slot-bank",
+        "128",
+        "--moe-prefetch-temporal",
+        "--ctx-size",
+        "4096",
+        "--flash-attn",
+        "on"
+      ],
+      "layer_flags": [
+        "--moe-eager-load",
+        "--streammoe-warmup"
+      ],
+      "startup_s": 60.233131708000656,
+      "rss_bytes": 25139298304,
+      "cold": [
+        {
+          "ttft_s": 3.50044274999982,
+          "decode_tokps": 4.938886043519165,
+          "total_s": 6.740039667000019,
+          "tokens": 17
+        }
+      ],
+      "warm": [
+        {
+          "ttft_s": 0.3509586660002242,
+          "decode_tokps": 21.73989842031963,
+          "total_s": 1.0869326660003935,
+          "tokens": 17
+        },
+        {
+          "ttft_s": 0.39928554199923383,
+          "decode_tokps": 22.19526166869091,
+          "total_s": 1.1201601249995292,
+          "tokens": 17
+        }
+      ],
+      "cold_ttft_p50": 3.50044274999982,
+      "warm_ttft_p50": 0.375122103999729,
+      "cold_decode_tokps": 4.938886043519165,
+      "warm_decode_tokps": 21.96758004450527
+    },
+    {
+      "model": "qwen36bf16",
+      "model_label": "Qwen3.6-35B-A3B-BF16",
+      "config": "L1L2L3L4_full",
+      "production_flags": [
+        "--moe-sidecar",
+        "/Users/claude/streammoe/models/qwen36-bf16-sidecar",
+        "--moe-mode",
+        "slot-bank",
+        "--moe-slot-bank",
+        "128",
+        "--moe-prefetch-temporal",
+        "--ctx-size",
+        "4096",
+        "--flash-attn",
+        "on"
+      ],
+      "layer_flags": [
+        "--moe-eager-load",
+        "--streammoe-warmup",
+        "--moe-keep-warm",
+        "60"
+      ],
+      "startup_s": 59.25030400000014,
+      "rss_bytes": 25137217536,
+      "cold": [
+        {
+          "ttft_s": 3.4968234160005522,
+          "decode_tokps": 4.982516621656885,
+          "total_s": 6.7080520409999735,
+          "tokens": 17
+        }
+      ],
+      "warm": [
+        {
+          "ttft_s": 0.36218408400054614,
+          "decode_tokps": 21.41516544896406,
+          "total_s": 1.1093181670003105,
+          "tokens": 17
+        },
+        {
+          "ttft_s": 0.40851554199980455,
+          "decode_tokps": 22.06516373515683,
+          "total_s": 1.1336404580006274,
+          "tokens": 17
+        }
+      ],
+      "cold_ttft_p50": 3.4968234160005522,
+      "warm_ttft_p50": 0.38534981300017535,
+      "cold_decode_tokps": 4.982516621656885,
+      "warm_decode_tokps": 21.740164592060445
+    }
+  ]
+}

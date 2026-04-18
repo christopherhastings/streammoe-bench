@@ -13,28 +13,29 @@
 
 ## Measured TTFT improvements (M4 Max 48 GB, N=3)
 
-### Q4_K_XL (18 GiB sidecar — fits in RAM)
+### Q4_K_XL (18 GiB sidecar — fits in RAM, sb=256)
 
-| Config            | Cold TTFT (s) | Warm p50 (s) | RSS (GiB) |
-|-------------------|--------------:|-------------:|----------:|
-| baseline          |         1.707 |        0.284 |      7.34 |
-| +L1 eager         |         1.061 |        0.191 |      6.91 |
-| +L1+L2+L3+L4 full |         1.087 |        0.198 |      7.01 |
+| Config            | Cold TTFT (s) | Warm TTFT (s) | Decode (tok/s) | RSS (GiB) |
+|-------------------|--------------:|--------------:|---------------:|----------:|
+| baseline          |         2.138 |         0.333 |          37.36 |      8.76 |
+| +L1 eager         |         1.239 |         0.281 |          33.64 |      8.33 |
+| +L1+L2 warmup     |         1.178 |         0.292 |          35.37 |      8.76 |
+| +L1+L2+L3+L4 full |         1.212 |         0.312 |          26.06 |      8.82 |
 
-**Cold TTFT: 38 % reduction. Warm p50: 32 % reduction.** Layer 1 captures the bulk.
+**Cold TTFT: 45 % reduction** (2.14 → 1.18 s). Decode regresses 2-4 tok/s under L1 (mlock competes with Metal); L3 regresses it 30 % (heartbeat race).
 
 ### BF16 (60 GiB sidecar — exceeds RAM, sb=128)
 
-| Config            | Cold TTFT (s) | Warm p50 (s) | RSS (GiB) |
-|-------------------|--------------:|-------------:|----------:|
-| baseline          |         3.633 |        0.672 |     18.63 |
-| +L1 eager         |         3.657 |        0.675 |     18.63 |
-| +L1+L2 warmup     |         3.571 |        0.605 |     18.90 |
-| +L1+L2+L3+L4 full |         3.506 |        0.998 |     18.88 |
+| Config            | Cold TTFT (s) | Warm TTFT (s) | Decode (tok/s) | RSS (GiB) |
+|-------------------|--------------:|--------------:|---------------:|----------:|
+| baseline          |         3.567 |         0.381 |          21.93 |     23.19 |
+| +L1 eager         |         3.513 |         0.398 |          21.36 |     23.20 |
+| +L1+L2 warmup     |         3.500 |         0.375 |          21.97 |     23.41 |
+| +L1+L2+L3+L4 full |         3.497 |         0.385 |          21.74 |     23.41 |
 
-**L1 is a no-op on BF16** (sidecar evicts from page cache before first prompt). **L2 alone gives a 10 % warm-p50 win.** **L3 regresses warm p50** (heartbeat steals Metal queue time during measurement; needs pause-on-activity gate — see streammoe-bench/RESULTS.md "Known issues").
+**BF16 streams at 22 tok/s** — matches the 22-23 tok/s production baseline. Layer 1 buys nothing (sidecar > RAM); Layer 2 is free. Don't use Layer 3 until the race is fixed.
 
-**Recommended config:** `--streammoe-warmup` alone on BF16; full stack on Q4.
+Full analysis and per-model recommended configs in `streammoe-bench/RESULTS.md`.
 
 ---
 
