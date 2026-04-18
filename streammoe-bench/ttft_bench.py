@@ -104,13 +104,17 @@ def wait_for_port(port: int, deadline: float) -> bool:
 
 def start_server(binary: str, model: ModelSpec, cfg: ConfigLayers,
                  port: int, log_path: Path) -> subprocess.Popen:
+    # --mlock intentionally omitted: BF16's 60 GiB sidecar exceeds 48 GiB
+    # physical RAM and every mlock call fails. Layer 1's TTFT win is from
+    # read-through populating the OS page cache (what pread hits), not from
+    # mlock pinning; the cached pages survive the duration of the per-cell
+    # measurement regardless.
     cmd = [
         binary,
         "-m", model.gguf,
         "--moe-sidecar", model.sidecar,
         "--moe-mode", "slot-bank",
         "--moe-slot-bank", "256",
-        "--mlock",
         "-ngl", "99",
         "--host", "127.0.0.1",
         "--port", str(port),
@@ -176,6 +180,12 @@ def measure_ttft(port: int, prompt: str, timeout_s: float = 60.0) -> float:
 def run_matrix(binary: str, output_dir: Path, n_iter: int, prompt: str) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {"generated_at": time.time(), "binary": binary, "runs": []}
+    # Incremental checkpoint path — gets overwritten after every cell so a
+    # kill midway still leaves recoverable data.
+    checkpoint = output_dir / "ttft_matrix_in_progress.json"
+
+    def save_checkpoint():
+        checkpoint.write_text(json.dumps(results, indent=2))
 
     for model in MODELS:
         if not os.path.exists(model.gguf):
@@ -226,6 +236,7 @@ def run_matrix(binary: str, output_dir: Path, n_iter: int, prompt: str) -> dict:
                 "warm_p95": (sorted(warm_ttft)[int(0.95*len(warm_ttft))-1]
                              if len(warm_ttft) >= 2 else None),
             })
+            save_checkpoint()
             time.sleep(1.0)
 
     return results

@@ -1,7 +1,39 @@
 # StreamMoE — Project Overview
 
-**Last updated:** 2026-04-17
-**Status:** Production config validated for Qwen3.6-35B-A3B. Option B (self-speculative decoding) empirically closed. Ready for 397B scale-up next session.
+**Last updated:** 2026-04-18
+**Status:** TTFT optimization patch shipped + measured (38% cold TTFT win on Q4_K_XL). Menu-bar app v0.1.0 production-ready (31/31 XCTest, .app bundles via build script). Safeguards added after BF16-on-48GiB caused host memory pressure.
+
+**Repos as of v0.1.0:**
+
+- **Fork:** `christopherhastings/anemll-flash-llama.cpp` branch `feature/moe-eager-load` — 4-layer TTFT patch + `/streammoe/status` + memory-safety guards
+- **App:** `christopherhastings/streammoe-app` — menu-bar SwiftUI client, builds to `StreamMoE.app`
+- **Bench:** `christopherhastings/streammoe-bench` — TTFT matrix harness + byte-identical quality verifier + measured RESULTS.md
+
+---
+
+## Measured TTFT improvements (Q4_K_XL, M4 Max 48 GB, N=3)
+
+| Config            | Cold TTFT (s) | Warm p50 (s) | RSS (GiB) |
+|-------------------|--------------:|-------------:|----------:|
+| baseline          |         1.707 |        0.284 |      7.34 |
+| +L1 eager         |         1.061 |        0.191 |      6.91 |
+| +L1+L2+L3+L4 full |         1.087 |        0.198 |      7.01 |
+
+**Cold TTFT: 38% reduction. Warm p50: 32% reduction.** Layer 1 captures the bulk; Layers 2/3 are insurance for keep-warm; Layer 4 (now opt-in only) helps on long prompts.
+
+BF16 numbers blocked by `--ngl 99` Metal allocation refusal — see Safeguards below.
+
+---
+
+## Safeguards added after BF16 host memory pressure (2026-04-18)
+
+Three behavior changes prevent the host from getting into a VM-thrash spiral when configs ask for more pinned memory than the machine has:
+
+1. **Layer 4 default reverted to `-ub 1`** — the auto-bump to 256 was OOMing Metal on BF16 (256× larger activation footprint). Now opt-in via explicit `-ub 256 -b 256`.
+2. **`eager_load_moe_sidecar` refuses mlock when sidecar > 60% of physical RAM** — falls back to read-through-only (still warms page cache).
+3. **Read-throttle when sidecar > physical RAM** — sleeps 1 ms every 64 MiB so the kernel can evict cleanly between chunks.
+
+These were the changes that made running BF16 on 48 GiB hardware destabilize the host. The crash was reproducible; the fix is in `c9b…` on the fork.
 
 > **Primary source of truth:** `/Users/claude/streammoe/README.md` — it has the detailed findings, reproducible commands, and next-step recommendations. This doc is the planning-repo view and points at the active work.
 

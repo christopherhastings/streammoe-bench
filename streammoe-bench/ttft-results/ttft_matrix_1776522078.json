@@ -1,0 +1,114 @@
+{
+  "generated_at": 1776521753.1605911,
+  "binary": "/Users/claude/streammoe/anemll-flash-llama.cpp/build/bin/llama-server",
+  "runs": [
+    {
+      "model": "q4_k_xl",
+      "config": "baseline",
+      "startup_s": 14.999762709,
+      "rss_bytes": 7881146368,
+      "cold_ttft_s": [
+        1.7073690419999998
+      ],
+      "warm_ttft_s": [
+        0.4235139169999975,
+        0.14361070900000072
+      ],
+      "cold_p50": 1.7073690419999998,
+      "warm_p50": 0.2835623129999991,
+      "warm_p95": 0.14361070900000072
+    },
+    {
+      "model": "q4_k_xl",
+      "config": "L1_eager",
+      "startup_s": 18.325937915999997,
+      "rss_bytes": 7423049728,
+      "cold_ttft_s": [
+        1.0607544160000018
+      ],
+      "warm_ttft_s": [
+        0.2359942499999974,
+        0.14530004200000235
+      ],
+      "cold_p50": 1.0607544160000018,
+      "warm_p50": 0.19064714599999988,
+      "warm_p95": 0.14530004200000235
+    },
+    {
+      "model": "q4_k_xl",
+      "config": "L1L2_warmup",
+      "startup_s": 18.334968916,
+      "rss_bytes": 8037269504,
+      "cold_ttft_s": [
+        1.0918611659999868
+      ],
+      "warm_ttft_s": [
+        0.23780541700000413,
+        0.14594133300001033
+      ],
+      "cold_p50": 1.0918611659999868,
+      "warm_p50": 0.19187337500000723,
+      "warm_p95": 0.14594133300001033
+    },
+    {
+      "model": "q4_k_xl",
+      "config": "L1L2L3L4_full",
+      "startup_s": 18.838943583000002,
+      "rss_bytes": 7523172352,
+      "cold_ttft_s": [
+        1.0869777500000026
+      ],
+      "warm_ttft_s": [
+        0.24927487499999756,
+        0.14633520799999644
+      ],
+      "cold_p50": 1.0869777500000026,
+      "warm_p50": 0.197805041499997,
+      "warm_p95": 0.14633520799999644
+    },
+    {
+      "model": "bf16",
+      "config": "baseline",
+      "startup_s": 39.57620725000001,
+      "rss_bytes": 3404169216,
+      "cold_ttft_s": [],
+      "warm_ttft_s": [],
+      "cold_p50": null,
+      "warm_p50": null,
+      "warm_p95": null
+    },
+    {
+      "model": "bf16",
+      "config": "L1_eager",
+      "startup_s": 62.57593054099999,
+      "rss_bytes": 2279571456,
+      "cold_ttft_s": [],
+      "warm_ttft_s": [],
+      "cold_p50": null,
+      "warm_p50": null,
+      "warm_p95": null
+    },
+    {
+      "model": "bf16",
+      "config": "L1L2_warmup",
+      "startup_s": 57.855031542000006,
+      "rss_bytes": 238092288,
+      "cold_ttft_s": [],
+      "warm_ttft_s": [],
+      "cold_p50": null,
+      "warm_p50": null,
+      "warm_p95": null
+    },
+    {
+      "model": "bf16",
+      "config": "L1L2L3L4_full",
+      "startup_s": 58.007389042,
+      "rss_bytes": 1060880384,
+      "cold_ttft_s": [],
+      "warm_ttft_s": [],
+      "cold_p50": null,
+      "warm_p50": null,
+      "warm_p95": null
+    }
+  ]
+}
