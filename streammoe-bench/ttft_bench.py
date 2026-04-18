@@ -127,6 +127,16 @@ def start_server(binary: str, model: ModelSpec, cfg: ConfigLayers,
         "--moe-sidecar", model.sidecar,
         "--moe-mode", "slot-bank",
         "--moe-slot-bank", str(model.slot_bank),
+        # CRITICAL: temporal prefetch is the mechanism that keeps the slot
+        # bank useful — it refreshes the current token's routed experts into
+        # slots right after decode so the next token's likely-reused experts
+        # are already resident. Without this, every prompt is cold and
+        # streaming performance collapses on sidecar > RAM. The prior
+        # streammoe_bench runner.py enabled this by default; the simpler
+        # bench had dropped it. (This is the flag called out in
+        # PROJECT_OVERVIEW's "validated production config".)
+        "--moe-prefetch-temporal",
+        "--flash-attn", "on",
         "-ngl", str(model.n_gpu_layers),
         "--host", "127.0.0.1",
         "--port", str(port),
