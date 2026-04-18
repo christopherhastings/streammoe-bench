@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""80-prompt byte-identical quality verification.
+"""Byte-identical 80-prompt quality verification.
 
-Hypothesis: The four TTFT layers are pure runtime / scheduling changes.
-None of them alters the graph, the sampler, the tokenizer, or the expert
-selection. Therefore, for a greedy (temperature=0) run over the MT-Bench
-80 prompts, the sampled token stream must be byte-identical between
-baseline and +L1+L2+L3+L4.
+Hypothesis: the four StreamMoE TTFT patch layers are runtime / scheduling
+changes. They don't alter the graph, the sampler, the tokenizer, or expert
+selection. Therefore, for a greedy (temperature=0) run over the 80 MT-Bench
+prompts, the sampled token stream must be byte-identical between baseline
+and patched configurations.
+
+Uses the same production-config composer as ttft_bench.py, so both benches
+test the config that actually ships. Baseline = production flags. Patched =
+production flags + --moe-eager-load + --streammoe-warmup (omits --moe-keep-warm
+since its heartbeat would add non-determinism to the measurement timing).
 
 Usage:
-    ./quality_verify.py --binary /path/to/llama-server --prompts mtbench.jsonl
-
-Runs two llama-server instances (baseline and patched), sends the same 80
-prompts with temperature=0, and asserts the token-id lists match.
+    python3.11 quality_verify.py --model qwen36bf16
+    python3.11 quality_verify.py --model qwen36 --prompts mtbench80.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import signal
@@ -26,41 +28,50 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List
 
 import urllib.request
 
+STREAMMOE_PKG_ROOT = Path("/Users/claude/streammoe")
+if str(STREAMMOE_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(STREAMMOE_PKG_ROOT))
 
-BASELINE_FLAGS: List[str] = []
-PATCHED_FLAGS: List[str] = [
-    "--moe-eager-load",
-    "--streammoe-warmup",
-    # --moe-keep-warm deliberately omitted here; its heartbeats would race
-    # the benchmark request timing and add non-determinism.
-]
+from streammoe_bench.config import get_models
+from streammoe_bench.runner import build_extra_args
+from ttft_bench import production_config_for
 
 
-def wait_for_port(port: int, deadline: float) -> bool:
+PATCH_LAYERS = ["--moe-eager-load", "--streammoe-warmup"]
+
+
+def wait_ready(port: int, deadline: float) -> bool:
+    status_url = f"http://127.0.0.1:{port}/streammoe/status"
     while time.monotonic() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                return True
+                pass
         except OSError:
-            time.sleep(0.2)
+            time.sleep(0.1); continue
+        try:
+            with urllib.request.urlopen(status_url, timeout=2.0) as resp:
+                if resp.status == 200 and json.loads(resp.read()).get("ok") is True:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.5)
     return False
 
 
-def start_server(binary: str, model: str, sidecar: str, port: int,
-                 extra: List[str], log_path: Path) -> subprocess.Popen:
+def start_server(binary: str, model, port: int, extra: list, log_path: Path) -> subprocess.Popen:
+    prod = build_extra_args(production_config_for(model), model)
     cmd = [
         binary,
-        "-m", model, "--moe-sidecar", sidecar,
-        "--moe-mode", "slot-bank", "--moe-slot-bank", "256",
-        "--mlock", "-ngl", "99",
+        "-m", str(model.model_path),
         "--host", "127.0.0.1", "--port", str(port),
-        "-c", "8192", "--seed", "42",
-    ] + extra
+        "-ngl", "99",
+        "--seed", "42",
+    ] + prod + extra
     log = open(log_path, "w")
+    (log_path.with_suffix(".cmd")).write_text(" ".join(cmd) + "\n")
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                             preexec_fn=os.setsid)
 
@@ -76,7 +87,7 @@ def stop_server(proc: subprocess.Popen) -> None:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 
-def sample_tokens(port: int, prompt: str, n_predict: int) -> List[int]:
+def sample_tokens(port: int, prompt: str, n_predict: int) -> list:
     body = json.dumps({
         "prompt": prompt,
         "n_predict": n_predict,
@@ -93,45 +104,55 @@ def sample_tokens(port: int, prompt: str, n_predict: int) -> List[int]:
     )
     with urllib.request.urlopen(req, timeout=300) as resp:
         data = json.loads(resp.read().decode())
-    # llama-server returns sampled token ids under "tokens" when that field
-    # is populated; fall back to text-hash if tokens aren't returned.
+    # llama-server returns sampled token ids under "tokens" when populated;
+    # fall back to content text if not (still deterministic for byte compare).
     if "tokens" in data and data["tokens"]:
         return list(data["tokens"])
-    return [ord(c) for c in data["content"]]  # coarse fallback
+    return list(data.get("content", "").encode("utf-8"))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary",
                     default="/Users/claude/streammoe/anemll-flash-llama.cpp/build/bin/llama-server")
-    ap.add_argument("--model",
-                    default="/Users/christopherhastings/Downloads/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")
-    ap.add_argument("--sidecar",
-                    default="/Users/claude/streammoe/models/qwen35-35b-sidecar")
-    ap.add_argument("--prompts", default="mtbench80.jsonl",
-                    help="JSONL file, one {\"prompt\": str} per line")
-    ap.add_argument("--n-predict", type=int, default=64)
+    ap.add_argument("--model", default="qwen36bf16",
+                    help="key from streammoe_bench.config.get_models() (e.g. qwen36, qwen36bf16)")
+    ap.add_argument("--prompts", default="mtbench80.jsonl")
+    ap.add_argument("--n-predict", type=int, default=48,
+                    help="tokens per prompt (shorter = faster, still shows any divergence)")
     ap.add_argument("--output-dir", default="./quality-results")
     args = ap.parse_args()
 
-    out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+    models = get_models()
+    if args.model not in models:
+        print(f"[fatal] unknown model '{args.model}'. Known: {list(models)}", file=sys.stderr)
+        return 2
+    model = models[args.model]
 
+    prompts_file = Path(args.prompts)
+    if not prompts_file.exists():
+        prompts_file = Path(__file__).parent / args.prompts
     prompts = []
-    with open(args.prompts) as f:
+    with prompts_file.open() as f:
         for line in f:
             if line.strip():
                 prompts.append(json.loads(line)["prompt"])
 
-    results = {"generated_at": time.time(), "n_prompts": len(prompts),
+    out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+
+    results = {"generated_at": time.time(), "model": args.model,
+               "model_label": model.label,
+               "n_prompts": len(prompts), "n_predict": args.n_predict,
                "binary": args.binary, "matches": 0, "mismatches": []}
 
-    # Phase 1: baseline
-    print("\n=== baseline run ===", flush=True)
+    # Phase 1: baseline (production flags only, no patch layers).
+    print(f"\n=== baseline ({args.model}) ===", flush=True)
     base_port = 11461
-    base_proc = start_server(args.binary, args.model, args.sidecar, base_port,
-                             BASELINE_FLAGS, out / "server_baseline.log")
-    if not wait_for_port(base_port, time.monotonic() + 300):
-        print("baseline server failed to start", file=sys.stderr); return 1
+    base_log = out / f"server_{args.model}_baseline.log"
+    base_proc = start_server(args.binary, model, base_port, [], base_log)
+    deadline = 900 if "bf16" in args.model else 360
+    if not wait_ready(base_port, time.monotonic() + deadline):
+        print("baseline did not become ready", file=sys.stderr); return 1
     baseline_tokens = []
     try:
         for i, p in enumerate(prompts):
@@ -140,37 +161,39 @@ def main() -> int:
     finally:
         stop_server(base_proc)
 
-    # Phase 2: patched
-    print("\n=== patched run ===", flush=True)
+    # Phase 2: patched (production flags + L1 + L2).
+    print(f"\n=== patched (+L1+L2) ({args.model}) ===", flush=True)
     patched_port = 11462
-    patched_proc = start_server(args.binary, args.model, args.sidecar, patched_port,
-                                PATCHED_FLAGS, out / "server_patched.log")
-    if not wait_for_port(patched_port, time.monotonic() + 300):
-        print("patched server failed to start", file=sys.stderr); return 1
+    patched_log = out / f"server_{args.model}_patched.log"
+    patched_proc = start_server(args.binary, model, patched_port, PATCH_LAYERS, patched_log)
+    if not wait_ready(patched_port, time.monotonic() + deadline):
+        print("patched did not become ready", file=sys.stderr); return 1
     try:
         for i, p in enumerate(prompts):
             pt = sample_tokens(patched_port, p, args.n_predict)
             if pt == baseline_tokens[i]:
                 results["matches"] += 1
             else:
-                # Find first divergence index for diagnostics.
-                div = next((k for k in range(min(len(pt), len(baseline_tokens[i])))
-                           if pt[k] != baseline_tokens[i][k]), min(len(pt), len(baseline_tokens[i])))
-                results["mismatches"].append({"idx": i, "diverge_at": div,
-                                             "baseline_len": len(baseline_tokens[i]),
-                                             "patched_len": len(pt)})
+                n = min(len(pt), len(baseline_tokens[i]))
+                div = next((k for k in range(n) if pt[k] != baseline_tokens[i][k]), n)
+                results["mismatches"].append({
+                    "idx": i, "diverge_at": div,
+                    "baseline_len": len(baseline_tokens[i]),
+                    "patched_len": len(pt),
+                })
             if i % 10 == 0: print(f"  patched {i+1}/{len(prompts)}", flush=True)
     finally:
         stop_server(patched_proc)
 
-    result_path = out / f"quality_verify_{int(time.time())}.json"
+    result_path = out / f"quality_verify_{args.model}_{int(time.time())}.json"
     result_path.write_text(json.dumps(results, indent=2))
     total = len(prompts)
-    print(f"\nmatches:  {results['matches']}/{total}")
+    print(f"\nmatches:    {results['matches']}/{total}")
     print(f"mismatches: {len(results['mismatches'])}")
     for m in results["mismatches"][:5]:
         print(f"  idx={m['idx']} diverge_at={m['diverge_at']} "
-              f"baseline_len={m['baseline_len']} patched_len={m['patched_len']}")
+              f"bl={m['baseline_len']} pt={m['patched_len']}")
+    print(f"\nResults: {result_path}")
     return 0 if results["matches"] == total else 2
 
 

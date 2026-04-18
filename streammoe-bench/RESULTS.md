@@ -101,6 +101,30 @@ short-prompt TTFT optimization is still available — just explicit.
 - `ttft-results/ttft_matrix_1776524320.json` — Run A BF16 (prefetch off, buggy)
 - `ttft-results/ttft_matrix_1776522078.json` — Run A Q4 (prefetch off, still OK because Q4 doesn't rely on prefetch as hard)
 
+## Q4 — streaming vs all-resident (from 80-prompt phase 2C, N=80)
+
+From the prior project's MT-Bench 80-prompt quality sweep (each cell runs
+all 80 prompts with temperature=0 + seed=42; numbers are per-prompt
+averages):
+
+| Mode                                 | Decode (tok/s) | RSS (GiB) | Quality vs stock |
+|--------------------------------------|---------------:|----------:|------------------|
+| **stock** (all experts resident)     |        25.12  |     21.54 | reference        |
+| **best-tps streaming** (sb=256 + temporal prefetch) |        22.14  |    **5.43** | equivalent (judge-verified) |
+| **lowest-ram streaming** (sb=256 + temporal + q4 KV + io_split=16) |        21.09  |    **4.92** | equivalent (judge-verified) |
+
+**Tradeoff: 12 % slower sustained decode for 4× less RAM.** Both streaming
+configurations pass the 80-prompt quality gate (Phase 2C LLM-as-judge,
+strict JSON) — zero regressions on algorithmic reasoning, writing,
+math, reasoning, or extraction categories.
+
+Short-prompt decode (16-token generation, Run C) ran faster at 37 tok/s
+because the slot-bank hit rate is higher on short prompts before the
+cache churn starts; 22 tok/s is the sustained-decode number that
+matches user experience.
+
+**Source:** `/Users/claude/streammoe/results/sweep_20260416_230927/phase2c_qwen36_summary.json`
+
 ## Reproducing
 
 ```sh
