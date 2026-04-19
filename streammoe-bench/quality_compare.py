@@ -57,6 +57,32 @@ from streammoe_bench.config import get_models
 QWEN36_Q4  = "qwen36"      # Qwen3.6-35B-A3B-UD-Q4_K_XL
 QWEN36_BF16 = "qwen36bf16" # Qwen3.6-35B-A3B-BF16
 
+# Extension: two additional models added on 2026-04-19 for cross-model
+# quality comparison against frontier references (Haiku 4.5, Sonnet 4.6).
+# These aren't in streammoe_bench.config.get_models() yet, so we register
+# them inline here as simple namespace objects that satisfy the fields our
+# flag builders and server spawner access (.model_path, .sidecar_dir, .label).
+from types import SimpleNamespace
+
+_EXTRA_MODELS = {
+    "qwen35_9b": SimpleNamespace(
+        key="qwen35_9b",
+        label="Qwen3.5-9B-Q4_K_M",
+        model_path=Path("/Users/christopherhastings/Downloads/qwen35-new-models/Qwen3.5-9B-Q4_K_M.gguf"),
+        sidecar_dir=None,       # dense model — no sidecar
+        total_experts=0,
+        moe_layers=0,
+    ),
+    "qwen35_122b": SimpleNamespace(
+        key="qwen35_122b",
+        label="Qwen3.5-122B-A10B-UD-Q4_K_XL",
+        model_path=Path("/Users/christopherhastings/Downloads/qwen35-new-models/Qwen3.5-122B-A10B-UD-Q4_K_XL-hf/UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf"),
+        sidecar_dir=Path("/Users/claude/streammoe/models/qwen35-122b-sidecar"),
+        total_experts=128,      # informational only
+        moe_layers=48,
+    ),
+}
+
 # Each config is a (name, model_key, flag_builder). The flag_builder runs
 # AFTER the base -m / --host / --port / --ctx-size / -ngl so you can add
 # streaming / sidecar flags without re-specifying the basics.
@@ -80,6 +106,24 @@ def bf16_streaming_flags(model):
         "--flash-attn", "on",
     ]
 
+def qwen35_9b_resident_flags(model):
+    # Dense 9B at Q4 — just flash-attn, no sidecar, no slot-bank. Fits in
+    # ~6 GB RAM. Included in the cross-model quality matrix as a small-model
+    # floor: how much quality does the 35B-class MoE actually buy over a
+    # dense Q4 ninth of its size?
+    return ["--flash-attn", "on"]
+
+def qwen35_122b_streaming_flags(model):
+    # 122B-A10B: 10B active of 122B total, 48 MoE layers, ~66 GB sidecar.
+    # Sidecar > RAM so we can't mlock; same pattern as BF16 35B. slot-bank
+    # 128 keeps Metal allocations inside the device budget.
+    return [
+        "--moe-sidecar", str(model.sidecar_dir),
+        "--moe-mode", "slot-bank", "--moe-slot-bank", "128",
+        "--moe-prefetch-temporal",
+        "--flash-attn", "on",
+    ]
+
 CONFIGS = {
     "q4_resident":    {"model_key": QWEN36_Q4,   "flags": q4_resident_flags,
                        "label": "GGUF Q4_K_XL resident (stock)"},
@@ -87,6 +131,10 @@ CONFIGS = {
                        "label": "GGUF Q4_K_XL slot-bank streaming (sb=256)"},
     "bf16_streaming": {"model_key": QWEN36_BF16, "flags": bf16_streaming_flags,
                        "label": "GGUF BF16 slot-bank streaming (sb=128)"},
+    "qwen35_9b":      {"model_key": "qwen35_9b",   "flags": qwen35_9b_resident_flags,
+                       "label": "Qwen3.5-9B Q4_K_M resident (dense)"},
+    "qwen35_122b":    {"model_key": "qwen35_122b", "flags": qwen35_122b_streaming_flags,
+                       "label": "Qwen3.5-122B-A10B slot-bank streaming (sb=128)"},
 }
 
 # Judge pairs — each (a_name, b_name) sends A as "stock" and B as "sidecar"
@@ -183,7 +231,11 @@ def sample(port: int, prompt: str, n_predict: int, timeout_s: float = 600.0) -> 
 def run_config(name: str, binary: str, output_dir: Path, prompts: list,
                n_predict: int, ctx_size: int) -> dict:
     cfg = CONFIGS[name]
-    model = get_models()[cfg["model_key"]]
+    mk = cfg["model_key"]
+    if mk in _EXTRA_MODELS:
+        model = _EXTRA_MODELS[mk]
+    else:
+        model = get_models()[mk]
     flags = cfg["flags"](model)
     port = 11500 + (abs(hash(name)) % 80)
     log_path = output_dir / f"server_{name}.log"
@@ -191,7 +243,8 @@ def run_config(name: str, binary: str, output_dir: Path, prompts: list,
     print(f"\n=== sampling {name} ({cfg['label']}) on port {port} ===", flush=True)
     t_load = time.perf_counter()
     proc = start_server(binary, model, flags, port, log_path, ctx_size)
-    deadline = 900 if "bf16" in name else 360
+    # 122B (48 layers, 66 GB sidecar) takes longer to read-through than BF16.
+    deadline = 1500 if "122b" in name else (900 if "bf16" in name else 360)
     if not wait_ready(port, time.monotonic() + deadline):
         stop_server(proc)
         return {"name": name, "error": "server did not become ready", "label": cfg["label"]}
