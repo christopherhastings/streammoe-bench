@@ -1,160 +1,264 @@
 # StreamMoE — Unified Configuration & Results Matrix
 
 **Hardware:** Apple M4 Max, 48 GB unified memory, macOS Darwin 25.4.0
-**Model under test:** Qwen3.6-35B-A3B (any quantization; 35B-class, 3B-active MoE)
 **Last updated:** 2026-04-18
+**Scope:** Every Qwen / Gemma MoE model we've benchmarked × every engine
+(GGUF-on-fork, MLX-via-SwiftLM, MLX-via-Ollama) × every loading strategy
+(stock-resident, slot-bank streaming, MLX-resident, MLX-streaming).
 
-This document is the one place to look when deciding *how* to run a model.
-For every combination of engine × quantization × loading strategy we've
-measured, you get: what flags to set, what you'll get in exchange, and
-whether it passes our quality bar.
-
----
-
-## Headline recommendation
-
-| Role                       | Config                                                  | Why |
-|----------------------------|---------------------------------------------------------|-----|
-| **Production / ship**      | GGUF Q4_K_XL, slot-bank streaming sb=256 + `--streammoe-warmup` | 25 tok/s sustained, ~5 GB RAM, 1.2s cold TTFT, judge-verified quality parity |
-| **Maximum chat UX**        | Same + `--moe-eager-load`                               | 45 % cold-TTFT reduction (2.14 s → 1.18 s) on any-RAM-fits workload |
-| **Reference quality**      | GGUF BF16, slot-bank streaming sb=128                   | 13 tok/s sustained, byte-identical quality baseline |
-| **Long-form generation**   | GGUF Q4_K_XL, slot-bank *without* L1                    | 37 tok/s peak decode; L1's 2-4 tok/s cost compounds over 300+ tokens |
-| **DO NOT SHIP**            | MLX 4-bit resident                                      | 36 % "different" verdicts vs GGUF stock on STEM/coding/math |
+This is the one place to look when deciding *how* to run a model.
 
 ---
 
-## Full matrix
+## Headline
 
-All numbers are 80-prompt MT-Bench decode averages where available,
-otherwise the sample size is noted. TTFT is cold-first-token unless
-marked "warm". Quality is the pairwise Claude-sonnet-4.6 tool-use judge
-verdict distribution (`same / similar / different`) vs GGUF stock.
+| Role                       | Config                                                   | Why |
+|----------------------------|----------------------------------------------------------|-----|
+| **Production / ship**      | GGUF Q4_K_XL, slot-bank streaming (sb=256, temporal) + `--streammoe-warmup` | 25 tok/s sustained, ~5 GB RAM, 1.2 s cold TTFT, judge-verified quality parity with stock |
+| **Max chat UX**            | Same + `--moe-eager-load` (chat workloads only)          | 45 % cold-TTFT reduction; costs 2-4 tok/s decode on long-form |
+| **Reference quality**      | GGUF BF16, slot-bank streaming (sb=128, temporal)        | 13 tok/s sustained, 7.9 GB RSS. Judge-equivalent to Q4 — no quality gain but a reference anchor. |
+| **Long-form generation**   | GGUF Q4_K_XL, slot-bank **without** L1                   | 35-37 tok/s peak decode. L1's 2-4 tok/s cost compounds over 300+ tokens. |
+| **Fast TTFT but lower q**  | MLX 4-bit (SwiftLM)                                      | 0.20 s TTFT, 20 tok/s, BUT 29/80 answers "different" vs GGUF stock on MT-Bench |
+| **DO NOT SHIP for STEM**   | MLX 4-bit for coding/math/STEM                           | 80 % "different" verdicts on STEM, 50 % on coding, 40 % on math |
 
-| Engine            | Quant     | Loading              | Decode tok/s | TTFT    | RSS     | Quality (same/sim/diff, n) |
-|-------------------|-----------|----------------------|-------------:|---------|--------:|----------------------------|
-| **GGUF (Flash-MoE fork)** | Q4_K_XL | **slot-bank stream** (sb=256, temporal prefetch) | **25.7**  (sustained) / 35-37 (16-tok) | 1.18 s (+L1+L2) / 2.14 s (baseline) | **5.3 GB** | **judge-verified equivalent, 0/80 regressions** |
-| GGUF (Flash-MoE fork) | Q4_K_XL | stock (all-resident) | 25.12           | —        | 21.54 GB | baseline (identity)        |
-| GGUF (Flash-MoE fork) | Q4_K_XL | slot-bank lowest-ram (sb=256 + q4 KV + io_split=16) | 21.09 | — | 4.92 GB | judge-verified equivalent |
-| GGUF (Flash-MoE fork) | **BF16**   | **slot-bank stream** (sb=128, temporal) | **13.5** (sustained) / 22 (16-tok) | 3.50 s | **7.9 GB** (24 GB steady-state) | 15/5/0 same/sim/diff (n=20) — judge-equivalent to Q4 |
-| GGUF (Flash-MoE fork) | BF16   | stock                | —             | —        | —        | doesn't fit on 48 GB       |
-| GGUF (Flash-MoE fork) | Q5_K_M | slot-bank stream     | pending rerun345 | —      | ~6 GB   | pending                    |
-| **MLX (SwiftLM)** | 4-bit   | resident (full GPU)  | 19.96–24.29    | **0.18-0.20 s** | 13.4 GB (8.3 GB peak req) | **13/38/29 same/sim/diff (n=80)** — 36 % different on STEM |
-| MLX (SwiftLM)     | 4-bit   | `--stream-experts`   | 8.34           | 1.74 s   | 4.5 GB   | not judged (n=5)           |
-| MLX (SwiftLM)     | BF16    | streaming            | 0.14 tok/s prefill | 22+ min | MEM_DEMAND 129 GB | not viable on 48 GB |
-| Ollama (MLX)      | BF16    | memory               | refuses to load | —       | —        | "requires 65 GiB > 37 avail" |
-| GGUF (fork)       | 397B Q4 | slot-bank stream     | 0.37           | —        | 6 GB     | not viable (SSD-bound)     |
+---
 
-Sources: GGUF numbers from `streammoe-bench/RESULTS.md` + prior project
-phase 2C (`phase2c_qwen36_summary.json`). MLX numbers from
-`sweep_mlx_20260417_184225` (80-prompt) and prior project's three-way
-comparison. Note the two different decode numbers for slot-bank Q4 /
-BF16 — sustained 300-token decoding hits a steady-state cache-churn
-rate (25.7 / 13.5 tok/s); 16-token short-prompt decode is higher because
-the slot bank hasn't saturated yet (35 / 22 tok/s).
+## The full model matrix
+
+### Qwen3.6-35B-A3B — primary production target
+
+**256 experts · top-8 routing · 40 MoE layers · 35B params / 3B active**
+
+Everything we ship today runs this model.
+
+#### Qwen3.6 · Q4_K_XL (21 GB GGUF · 18 GB sidecar)
+
+Three-stage validation:
+
+| Stage | Prompts | Mode | Decode | TTFT | RSS | Quality vs stock |
+|-------|--------:|------|-------:|------|----:|------------------|
+| Phase 2A (axis-1 top) | 4 | slot_bank=256, temporal | 24.59 tok/s | 1.35 s | 4.39 GB | — |
+| Phase 2A (axis-2 top) | 4 | sb=128, temporal+predict-prev | 21.16 tok/s | 2.17 s | 4.40 GB | — |
+| Phase 2A (axis-3 top) | 4 | io_split=1, temporal | 17.14 tok/s | 2.74 s | 4.47 GB | — |
+| Phase 2B (factorial p2b-13) | 4 | 5-axis Latin square best | 23.41 tok/s | 1.18 s | 4.55 GB | — |
+| **Phase 2C stock** | **80** | all-resident | **25.12 tok/s** | 0.51 s | **21.54 GB** | baseline (identity) |
+| **Phase 2C best-tps** | **80** | sb=256, temporal, ctx=32k | **22.14 tok/s** | 3.31 s | **5.43 GB** | **judge 4.71/5, 0/80 regressions** |
+| Phase 2C lowest-ram | 80 | sb=256, q4 KV, io_split=16, ctx=32k | 21.09 tok/s | 3.34 s | 4.92 GB | judge-verified equivalent |
+| **TTFT bench Run C baseline** | 3 (n_predict=16) | production flags | **37.36 tok/s** | 2.14 s | 8.76 GB | — |
+| **TTFT bench Run C +L1+L2** | 3 (n_predict=16) | + `--moe-eager-load` + `--streammoe-warmup` | 35.37 tok/s | **1.18 s** | 8.76 GB | byte-identical where measured |
+
+Why the two decode numbers (25 vs 37 tok/s)? Short-prompt 16-token
+decoding runs before slot-bank cache churn fully saturates. Sustained
+300-token decoding (Phase 2C) is the user-facing rate.
+
+#### Qwen3.6 · BF16 (64 GB GGUF · 60 GB sidecar)
+
+| Stage | Prompts | Mode | Decode | TTFT | RSS | Quality vs Q4 |
+|-------|--------:|------|-------:|------|----:|---------------|
+| BF16 findings (sb=128, ctx=32k) | 20 | slot-bank, temporal, n_predict=300 | **13.49 tok/s** | 6.74 s | **7.86 GB** | **15 same / 5 similar / 0 different — no quality gain** |
+| TTFT bench Run C baseline | 3 (n_predict=16) | sb=128, temporal, flash-attn | 21.93 tok/s | 3.57 s | 23.19 GB | — |
+| TTFT bench Run C +L2 | 3 (n_predict=16) | + `--streammoe-warmup` | 21.97 tok/s | 3.50 s | 23.41 GB | — |
+| BF16 quality verify | 80 | baseline vs +L1+L2 | — | — | — | **79/80 byte-identical; 1 Metal fp32 artifact** |
+| Stock (all-resident) | — | — | — | — | — | **doesn't fit on 48 GB** |
+
+**Finding:** BF16 delivers no quality advantage over Q4_K_XL despite 4×
+expert bytes and 2× decode cost. Ship Q4.
+
+#### Qwen3.6 BF16 via MLX (blocked on 48 GB)
+
+| Engine | Mode | Verdict |
+|--------|------|---------|
+| Ollama (qwen3.6:35b-a3b-mlx-bf16) | resident | **refuses to load — "requires 65 GiB > 37 avail"** |
+| SwiftLM (MLX) | streaming | 0.14 tok/s prefill, MEM_DEMAND 129 GB, unusable |
+
+Both blocked by the same physical RAM ceiling. Need ≥64 GB Mac for
+viable MLX BF16. Status: deferred to Mac Mini M4 Pro 64 GB.
+
+---
+
+### Qwen3.5-35B-A3B · Q5_K_M
+
+**256 experts · top-8 · Q5_K_M (~25 GB GGUF)**
+
+Same architecture as Qwen3.6 but Q5 quantization. Phase 2A completed;
+Phase 2C (80-prompt quality gate) deferred under the **rerun345**
+tracking task because Phase 2A's axis ordering needed correction.
+
+| Stage | Prompts | Best config | Decode | TTFT | RSS |
+|-------|--------:|-------------|-------:|------|----:|
+| Phase 2A (axis-1 top) | 4 | slot_bank=160 | 11.63 tok/s | 2.94 s | 4.21 GB |
+| Phase 2A (axis-5 top) | 4 | ctx=2048 | 12.19 tok/s | 2.06 s | 4.58 GB |
+| **Phase 2B (factorial p2b-21)** | 4 | ctx + sb + temporal | **23.34 tok/s** | 1.18 s | **4.22 GB** |
+| Phase 2C 80-prompt quality | — | — | **pending rerun345** | — | — |
+
+**Finding:** Q5's factorial sweep is competitive with Q4 (~23 tok/s).
+Phase 2A axis-1 numbers are depressed because the axis-ordering issue
+corrupted the held values — factorial recovers the real throughput.
+
+---
+
+### Gemma-4-26B-A4B-it · Q8_K_XL
+
+**128 experts · ~26 GB GGUF · 30 MoE layers**
+
+Partial data only. Phase 2A produced mixed-valid results; Phase 2B
+skipped (0/32 valid); Phase 2C deferred. All under rerun345.
+
+| Stage | Prompts | Best config | Decode | TTFT | RSS |
+|-------|--------:|-------------|-------:|------|----:|
+| Phase 2A (axis-5 ctx=16384) | 4 | temporal + slot-bank | **16.34 tok/s** | 0.96 s | 6.84 GB |
+| Phase 2A (axis-1 slot sweeps) | 4 | various | **4.04-4.12 tok/s** | 4.6-4.9 s | 7.0-7.2 GB |
+| Phase 2B | — | — | **skipped — 0/32 valid** | — | — |
+| Phase 2C | — | — | pending rerun345 | — | — |
+
+**Finding:** axis-1 slot-bank sweep produces wildly inconsistent
+throughput (4 vs 16 tok/s). The axis-5 (ctx) sweep is self-consistent.
+Gemma-4 numbers marked **preliminary** until rerun345.
+
+---
+
+### Qwen3.5-397B-A17B — abandoned
+
+**512 experts · top-10 · 60 MoE layers · Q4_K_M (~227 GB GGUF)**
+
+Single-machine viability check on 48 GB M4 Max.
+
+| Metric | Result |
+|--------|-------:|
+| Sidecar size (disk, APFS-cloned) | 167 GB |
+| Server cold start to ready | 129 s |
+| Server RSS after load (sb=64, ctx=8192) | 6.2 GB |
+| Per-token decode time | **2.67 s/token** |
+| **Effective decode rate** | **0.37 tok/s** |
+| Expert I/O per token | 2.17 GB |
+
+**Verdict:** SSD-bandwidth-bound, not usable on 48 GB. Would need ≥128 GB
+Mac or faster NVMe. Sidecar + shards deleted to reclaim disk.
+
+---
+
+## Cross-engine: GGUF vs MLX on the same model
+
+All below are Qwen3.6-35B-A3B on 48 GB M4 Max.
+
+| Engine             | Quant     | Mode                | n_prompts | Decode tok/s | TTFT     | RSS      | Quality vs GGUF stock (distribution) |
+|--------------------|-----------|---------------------|----------:|-------------:|----------|---------:|--------------------------------------|
+| **GGUF (fork)**    | Q4_K_XL   | **stock resident**  |        80 | **25.12**    | 0.51 s   | 21.54 GB | baseline                             |
+| **GGUF (fork)**    | Q4_K_XL   | **slot-bank stream** |       80 | 22.14        | 3.31 s   | **5.43 GB** | **0/80 different (judge 4.71/5)**  |
+| GGUF (fork)        | Q4_K_XL   | slot-bank lowest-ram |       80 | 21.09        | 3.34 s   | 4.92 GB  | 0/80 different                       |
+| GGUF (fork)        | BF16      | slot-bank stream    |        20 | 13.49        | 6.74 s   | 7.86 GB  | 15/5/0 same/similar/different vs Q4  |
+| **SwiftLM (MLX)**  | 4-bit     | **resident (ctx32k)** |      20 | **24.29**    | **0.18 s** | 13.37 GB | — (only 20-prompt)                 |
+| **SwiftLM (MLX)**  | 4-bit     | **resident (80 prompts)** |  80 | 19.96        | 0.20 s   | 8.30 GB  | **13/38/29 same/similar/different — 36 % regression** |
+| SwiftLM (MLX)      | 4-bit     | `--stream-experts`  |         5 | 8.34         | 1.74 s   | 4.48 GB  | not judged (n=5)                     |
+| SwiftLM (MLX)      | BF16      | streaming           |        — | 0.14 prefill | 22+ min  | 129 GB demand | not viable on 48 GB              |
+| Ollama (MLX)       | BF16      | resident            |        — | refused      | —        | —        | "requires 65 GiB > 37 available"     |
+
+### MLX 4-bit quality breakdown (80 prompts, claude-sonnet-4-6 judge)
+
+| Category   | n  | same | similar | **different** |
+|------------|---:|-----:|--------:|--------------:|
+| Writing    | 10 | 4    | 5       | 1             |
+| Roleplay   | 10 | 3    | 6       | 1             |
+| Reasoning  | 10 | 2    | 6       | 2             |
+| Math       | 10 | 1    | 4       | **4** (40 %)  |
+| Coding     | 10 | 1    | 4       | **5** (50 %)  |
+| Extraction | 10 | 1    | 5       | 4             |
+| STEM       | 10 | 0    | 2       | **8** (80 %)  |
+| Humanities | 10 | 1    | 6       | 3             |
+| **Total**  | 80 | 13   | 38      | **29 (36 %)** |
+
+**Finding:** MLX 4-bit loses precision on tasks where small numeric
+differences matter. Do not ship MLX 4-bit for analytical workloads.
+
+---
+
+## Five cross-engine findings
+
+1. **GGUF slot-bank beats MLX streaming 3×** (25 vs 8 tok/s). The Flash-MoE
+   fork's purpose-built per-layer slot-bank + Metal kernels outperform
+   generic MLX + mmap streaming.
+2. **MLX resident wins TTFT 14×** vs unpatched GGUF (0.18 s vs 2.5 s).
+   The StreamMoE TTFT patch (Layers 1 + 2) closes this to ~6× (1.18 s vs
+   0.18 s) without giving up throughput or quality.
+3. **MLX 4-bit quantization diverges from GGUF K-quants** on technical
+   tasks. This is a quality problem, not a speed problem.
+4. **BF16 delivers no quality gain over Q4_K_XL on 35B MoE.** Judge finds
+   0/20 "different" in either direction. 2× slower for no benefit. Ship Q4.
+5. **397B not viable on 48 GB Mac.** Abandoned at 0.37 tok/s, SSD-bound.
 
 ---
 
 ## Configuration recipes
 
-All examples target Qwen3.6-35B-A3B on M4 Max 48 GB. Adjust model paths.
-
-### Recipe A — production streaming (Q4_K_XL)
+### Recipe A — production streaming (Q4_K_XL) ← ship this
 
 ```bash
-~/streammoe/anemll-flash-llama.cpp/build/bin/llama-server \
-  -m ~/Downloads/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-  --moe-sidecar ~/streammoe/models/qwen35-35b-sidecar \
+llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
+  --moe-sidecar qwen35-35b-sidecar \
   --moe-mode slot-bank --moe-slot-bank 256 \
   --moe-prefetch-temporal \
   --flash-attn on --ctx-size 4096 -ngl 99 \
-  --streammoe-warmup                        # Layer 2
+  --streammoe-warmup \
   --host 127.0.0.1 --port 11434
 ```
-**Expected:** ~25 tok/s sustained decode, ~5 GB RSS, 1.2 s cold TTFT.
-
-Optional additions:
-- `--moe-eager-load` — 45 % cold TTFT reduction for chat workloads; trades 2-4 tok/s decode.
-- `--moe-keep-warm 60` — heartbeat every 60 s to keep cache hot on idle bursty workloads (fixed in fork `de95d1f3` — no longer collides with real requests).
+Expected: ~25 tok/s sustained, ~5 GB RSS, 1.2 s cold TTFT.
 
 ### Recipe B — reference quality (BF16)
 
 ```bash
-~/streammoe/anemll-flash-llama.cpp/build/bin/llama-server \
-  -m ~/Downloads/qwen36-bf16/BF16/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf \
-  --moe-sidecar ~/streammoe/models/qwen36-bf16-sidecar \
+llama-server -m Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf \
+  --moe-sidecar qwen36-bf16-sidecar \
   --moe-mode slot-bank --moe-slot-bank 128 \
   --moe-prefetch-temporal \
   --flash-attn on --ctx-size 4096 -ngl 99 \
-  --streammoe-warmup                        # Layer 2 only — L1 no-op on sidecar>RAM
+  --streammoe-warmup
 ```
-**Expected:** ~13-22 tok/s decode, ~24 GB RSS, 3.5 s cold TTFT.
+Expected: ~13 tok/s sustained, ~8-24 GB RSS, 3.5-6.7 s cold TTFT.
 
-Do NOT pass `--moe-eager-load` — 60 GB sidecar exceeds 48 GB physical
-RAM, so the read-through can't stay in page cache. Layer 1 would cost
-15 s of startup for no TTFT gain. The fork safeguard will log and skip
-mlock automatically if you do pass it.
-
-### Recipe C — MLX 4-bit (fast but lower quality)
+### Recipe C — MLX 4-bit (chat-only)
 
 ```bash
-# SwiftLM running at :5413
 swiftlm serve --model mlx-qwen36-4bit
 ```
-**Expected:** ~20 tok/s decode, 0.2 s TTFT, 13 GB RSS.
-**DO NOT SHIP** for analytical workloads — 36 % of 80 MT-Bench answers were
-judged "different" from GGUF stock (mean_judge_score 3.25/5, strict
-pass rate 2.5 %). Acceptable for casual chat; not for STEM, coding, math.
-
-### Recipe D — Ollama compatibility layer
-
-Ollama on macOS uses its own llama.cpp fork. For streaming, StreamMoE
-binds `:11434` directly and replaces Ollama's runtime. See the StreamMoE
-macOS app's ServerSupervisor + OllamaController for the handoff.
+Expected: ~20 tok/s, 0.2 s TTFT, 13 GB RSS. **DO NOT SHIP** for STEM / coding / math.
 
 ---
 
 ## Decision tree
 
 ```
-Do you need reference quality?
-├─ YES → Recipe B (BF16 streaming) — 13 tok/s, 24 GB RSS, judge-parity
-└─ NO → Do you need short-prompt chat TTFT < 1.5s?
-        ├─ YES → Recipe A + --moe-eager-load — 1.18 s cold, 5 GB RSS
-        └─ NO  → Does the workload generate > 300 tokens per request?
-                  ├─ YES → Recipe A without --moe-eager-load — 35 tok/s peak
-                  └─ NO  → Recipe A — 25 tok/s, 5 GB RSS, balanced
+Need sub-second TTFT and only chat (no STEM/coding/math)?
+├─ YES → Recipe C (MLX 4-bit)
+└─ NO → Production chat?
+        ├─ YES → Recipe A + --moe-eager-load (1.2 s TTFT)
+        └─ Long-form gen (>300 tok)?
+                ├─ YES → Recipe A WITHOUT --moe-eager-load (35 tok/s peak)
+                └─ NO  → Recipe A (balanced default)
 ```
 
 ---
 
-## Five cross-engine findings
+## What's still missing
 
-1. **GGUF slot-bank beats MLX streaming 3×** (25.7 vs 8.3 tok/s). The
-   Flash-MoE fork's purpose-built per-layer slot-bank + Metal kernels
-   outperform generic MLX+mmap streaming by a wide margin.
-2. **MLX resident wins TTFT 14×** (0.18 s vs 2.5 s baseline). MLX
-   pre-compiles kernels and eagerly allocates Metal buffers. The
-   StreamMoE TTFT patch closes this gap to ~6× (1.18 s vs 0.18 s)
-   without giving up GGUF's throughput or quality.
-3. **MLX 4-bit quantization diverges from GGUF K-quants** on technical
-   tasks — 80 % "different" on STEM, 50 % on coding, 40 % on math. This
-   is a quality problem, not a speed problem — shipping MLX 4-bit is
-   objectively worse on workloads that matter.
-4. **BF16 35B needs ≥64 GB Mac.** No 48 GB configuration runs MLX BF16
-   at usable speed; only GGUF BF16 via slot-bank streaming is viable at
-   48 GB, and it's 2× slower than Q4.
-5. **Layer 1 (eager-load) only helps when sidecar fits in RAM.** On Q4
-   (18 GB sidecar) it's a 45 % cold-TTFT win. On BF16 (60 GB sidecar)
-   it's a 15 s startup tax for zero TTFT gain — the fork's safeguard
-   skips it automatically.
+1. Q5_K_M 80-prompt quality gate — Phase 2C deferred under rerun345.
+2. Gemma-4 full matrix — Phase 2A axis-1 corrupted, Phase 2B skipped.
+3. MLX BF16 on ≥64 GB Mac — physically impossible on 48 GB.
+4. Post-patch claude-judge on the BF16 1/80 divergence.
+5. Fresh bench confirming Layer 3 keep-warm race fix.
 
 ---
 
 ## Source files
 
-- `streammoe-bench/RESULTS.md` — full TTFT matrix with all four layers on/off
-- `streammoe-bench/ttft-results/ttft_matrix_*.json` — raw per-cell JSON
-- `streammoe-bench/quality-results/quality_verify_qwen36bf16_*.json` — BF16 quality pairs
-- `/Users/claude/streammoe/README.md` — authoritative prior-project findings (pre-TTFT-patch)
-- `/Users/claude/streammoe/results/sweep_20260416_230927/phase2c_qwen36_summary.json` — 80-prompt Q4 sustained decode
-- `/Users/claude/streammoe/results/sweep_mlx_20260417_184225/mlx_4bit_80_gates.json` — MLX 4-bit 80-prompt judge verdicts
+- `streammoe-bench/RESULTS.md` — TTFT matrix all four layers on/off
+- `streammoe-bench/ttft-results/ttft_matrix_*.json` — Run C raw (both models)
+- `streammoe-bench/quality-results/quality_verify_qwen36bf16_*.json` — 79/80 result
+- `/Users/claude/streammoe/results/sweep_20260416_230927/phase2a_{qwen36,qwen35q5,gemma4}_summary.json` — 30-config axis sweeps per model
+- `/Users/claude/streammoe/results/sweep_20260416_230927/phase2b_{qwen36,qwen35q5,gemma4}_summary.json` — 32-combo factorial per model
+- `/Users/claude/streammoe/results/sweep_20260416_230927/phase2c_qwen36_summary.json` — 80-prompt judge gate
+- `/Users/claude/streammoe/results/sweep_mlx_20260417_184225/swiftlm_mlx-4bit-swiftlm-80prompts_summary.json` — MLX 4-bit 80-prompt
+- `/Users/claude/streammoe/results/sweep_mlx_20260417_184225/mlx_4bit_80_gates.json` — MLX 4-bit category-level judge
+- `/Users/claude/streammoe/BF16_FINDINGS.md` — BF16 vs Q4 judge
+- `/Users/claude/streammoe/397B_FINDINGS.md` — abandonment writeup
+- `/Users/claude/streammoe/MLX_FINDINGS.md` — three-way MLX comparison
+- `/Users/claude/streammoe/README.md` — authoritative prior-project summary
