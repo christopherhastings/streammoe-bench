@@ -113,18 +113,27 @@ prior sweep used) instead of `==`; the judge confirmed equivalence on
 all 80 prompts of the current streaming config pre-patch. A follow-up
 task captures plugging it in.
 
-## Known issues
+## Known issues / per-workload guidance
 
-1. **Layer 3 keep-warm heartbeat races with real requests.** Steals
-   Metal command-queue time during user inference. Fix: track
-   `last_request_ns` atomically in the request handler; skip the
-   heartbeat if activity happened within the last `interval_s`.
+1. **Layer 3 keep-warm heartbeat race — FIXED.** Previously the heartbeat
+   fired unconditionally every `interval_s` seconds and collided with
+   real user requests, collapsing Q4 decode from 37 → 26 tok/s. Fixed in
+   `server.cpp` via an atomic `streammoe_last_user_request_ns` that the
+   ex_wrapper stamps on every non-heartbeat request. The heartbeat thread
+   reads it and skips its cycle if user activity happened within the
+   last `interval_s`. The heartbeat's own curl sends
+   `X-StreamMoE-Warmup: 1` so it doesn't reset the gate itself. Needs
+   a fresh bench run to confirm the regression is gone.
 2. **Layer 1 on Q4 trades 2-4 tok/s decode for 45 % cold TTFT win.** The
    mlock'd sidecar pages compete with Metal unified-memory pressure.
-   Acceptable tradeoff for chat workloads; not for long-generation ones.
-3. **Cold TTFT on BF16 is SSD-bandwidth-bound at ~3.5 s.** Not fixable
-   via patch layers; the only path is shrinking the sidecar
-   (4-bit quantization of routed experts → fits in RAM → L1 works).
+   **Recommended by workload:**
+   - Chat / interactive (short responses, < 100 tokens decoded): enable
+     L1 — the cold-TTFT win dominates and the per-token cost is
+     negligible relative to user reaction time.
+   - Long-form generation (summaries, document translation, agent loops
+     that run > 300 tokens): skip L1 to keep the full 37 tok/s decode.
+     The 2-4 tok/s regression compounds over long generations and
+     dwarfs the one-time cold-TTFT win.
 
 ## Files
 

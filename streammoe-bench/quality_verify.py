@@ -87,7 +87,12 @@ def stop_server(proc: subprocess.Popen) -> None:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 
-def sample_tokens(port: int, prompt: str, n_predict: int) -> list:
+def sample_completion(port: int, prompt: str, n_predict: int) -> dict:
+    """Returns {tokens, content}. tokens is a list[int] from llama.cpp's
+    sampled token ids if available, else falls back to utf-8 byte-list of
+    content (still deterministic for byte-compare). content is the generated
+    text — kept so the downstream LLM judge can evaluate meaning-equivalence
+    when strict byte-match fails for non-deterministic Metal fp32 reasons."""
     body = json.dumps({
         "prompt": prompt,
         "n_predict": n_predict,
@@ -104,11 +109,12 @@ def sample_tokens(port: int, prompt: str, n_predict: int) -> list:
     )
     with urllib.request.urlopen(req, timeout=300) as resp:
         data = json.loads(resp.read().decode())
-    # llama-server returns sampled token ids under "tokens" when populated;
-    # fall back to content text if not (still deterministic for byte compare).
+    content = data.get("content", "")
     if "tokens" in data and data["tokens"]:
-        return list(data["tokens"])
-    return list(data.get("content", "").encode("utf-8"))
+        tokens = list(data["tokens"])
+    else:
+        tokens = list(content.encode("utf-8"))
+    return {"tokens": tokens, "content": content}
 
 
 def main() -> int:
@@ -121,6 +127,12 @@ def main() -> int:
     ap.add_argument("--n-predict", type=int, default=48,
                     help="tokens per prompt (shorter = faster, still shows any divergence)")
     ap.add_argument("--output-dir", default="./quality-results")
+    ap.add_argument("--judge", action="store_true",
+                    help="after strict == check, send divergent pairs to Claude judge "
+                         "(tool-use strict JSON, via streammoe_bench.quality_gates.judge_pair). "
+                         "Requires ANTHROPIC_API_KEY.")
+    ap.add_argument("--judge-model", default="claude-sonnet-4-6",
+                    help="Anthropic model id for judging")
     args = ap.parse_args()
 
     models = get_models()
@@ -143,7 +155,7 @@ def main() -> int:
     results = {"generated_at": time.time(), "model": args.model,
                "model_label": model.label,
                "n_prompts": len(prompts), "n_predict": args.n_predict,
-               "binary": args.binary, "matches": 0, "mismatches": []}
+               "binary": args.binary, "byte_matches": 0, "pairs": []}
 
     # Phase 1: baseline (production flags only, no patch layers).
     print(f"\n=== baseline ({args.model}) ===", flush=True)
@@ -153,10 +165,10 @@ def main() -> int:
     deadline = 900 if "bf16" in args.model else 360
     if not wait_ready(base_port, time.monotonic() + deadline):
         print("baseline did not become ready", file=sys.stderr); return 1
-    baseline_tokens = []
+    baselines = []
     try:
         for i, p in enumerate(prompts):
-            baseline_tokens.append(sample_tokens(base_port, p, args.n_predict))
+            baselines.append(sample_completion(base_port, p, args.n_predict))
             if i % 10 == 0: print(f"  baseline {i+1}/{len(prompts)}", flush=True)
     finally:
         stop_server(base_proc)
@@ -170,31 +182,78 @@ def main() -> int:
         print("patched did not become ready", file=sys.stderr); return 1
     try:
         for i, p in enumerate(prompts):
-            pt = sample_tokens(patched_port, p, args.n_predict)
-            if pt == baseline_tokens[i]:
-                results["matches"] += 1
-            else:
-                n = min(len(pt), len(baseline_tokens[i]))
-                div = next((k for k in range(n) if pt[k] != baseline_tokens[i][k]), n)
-                results["mismatches"].append({
-                    "idx": i, "diverge_at": div,
-                    "baseline_len": len(baseline_tokens[i]),
-                    "patched_len": len(pt),
-                })
+            pt = sample_completion(patched_port, p, args.n_predict)
+            byte_eq = pt["tokens"] == baselines[i]["tokens"]
+            if byte_eq:
+                results["byte_matches"] += 1
+            n = min(len(pt["tokens"]), len(baselines[i]["tokens"]))
+            div = next((k for k in range(n) if pt["tokens"][k] != baselines[i]["tokens"][k]), n) \
+                  if not byte_eq else None
+            # Keep full texts so a judge pass (below) can decide meaning-
+            # equivalence when byte_eq is false.
+            results["pairs"].append({
+                "idx": i, "prompt": p,
+                "baseline": baselines[i]["content"],
+                "patched": pt["content"],
+                "byte_eq": byte_eq,
+                "diverge_at": div,
+                "baseline_token_len": len(baselines[i]["tokens"]),
+                "patched_token_len": len(pt["tokens"]),
+            })
             if i % 10 == 0: print(f"  patched {i+1}/{len(prompts)}", flush=True)
     finally:
         stop_server(patched_proc)
 
+    # Phase 3 (optional): LLM judge on the pairs that failed strict ==.
+    # Metal fp32 reductions aren't bit-reproducible, so a handful of
+    # divergences is expected noise; the judge is the real quality gate.
+    if args.judge:
+        print(f"\n=== judging {sum(1 for p in results['pairs'] if not p['byte_eq'])} divergent pairs ===", flush=True)
+        try:
+            import anthropic
+            from streammoe_bench.quality_gates import judge_pair
+        except ImportError as e:
+            print(f"[judge skipped] missing dep: {e}", file=sys.stderr)
+        else:
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if not api_key:
+                print("[judge skipped] ANTHROPIC_API_KEY not set", file=sys.stderr)
+            else:
+                client = anthropic.Anthropic(api_key=api_key)
+                verdict_counts = {"same": 0, "similar": 0, "different": 0, "parse_error": 0}
+                for pair in results["pairs"]:
+                    if pair["byte_eq"]:
+                        pair["judge"] = {"verdict": "same", "score": 5,
+                                         "reason": "byte-identical (no judge call needed)"}
+                        verdict_counts["same"] += 1
+                        continue
+                    v = judge_pair(client, pair["prompt"],
+                                   pair["baseline"], pair["patched"],
+                                   model=args.judge_model)
+                    pair["judge"] = v
+                    verdict_counts[v["verdict"]] = verdict_counts.get(v["verdict"], 0) + 1
+                    print(f"  idx={pair['idx']:2d} verdict={v['verdict']:10s} score={v.get('score')} reason={v.get('reason','')[:80]}")
+                results["judge_summary"] = verdict_counts
+                results["judge_model"] = args.judge_model
+
     result_path = out / f"quality_verify_{args.model}_{int(time.time())}.json"
     result_path.write_text(json.dumps(results, indent=2))
     total = len(prompts)
-    print(f"\nmatches:    {results['matches']}/{total}")
-    print(f"mismatches: {len(results['mismatches'])}")
-    for m in results["mismatches"][:5]:
-        print(f"  idx={m['idx']} diverge_at={m['diverge_at']} "
-              f"bl={m['baseline_len']} pt={m['patched_len']}")
+    diverged = sum(1 for p in results["pairs"] if not p["byte_eq"])
+    print(f"\nbyte matches:   {results['byte_matches']}/{total} ({100*results['byte_matches']/total:.1f}%)")
+    print(f"divergent:      {diverged}")
+    if "judge_summary" in results:
+        j = results["judge_summary"]
+        equiv = j.get("same", 0) + j.get("similar", 0)
+        print(f"judge verdicts: same={j.get('same',0)} similar={j.get('similar',0)} "
+              f"different={j.get('different',0)} parse_error={j.get('parse_error',0)}")
+        print(f"semantic-equivalent: {equiv}/{total} ({100*equiv/total:.1f}%)")
     print(f"\nResults: {result_path}")
-    return 0 if results["matches"] == total else 2
+    # Exit 0 if ALL pairs judged same/similar (or byte-equal if no judge).
+    if "judge_summary" in results:
+        return 0 if results["judge_summary"].get("different", 0) == 0 and \
+                    results["judge_summary"].get("parse_error", 0) == 0 else 2
+    return 0 if results["byte_matches"] == total else 2
 
 
 if __name__ == "__main__":
