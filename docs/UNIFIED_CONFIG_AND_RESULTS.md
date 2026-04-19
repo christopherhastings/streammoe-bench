@@ -137,6 +137,56 @@ Mac or faster NVMe. Sidecar + shards deleted to reclaim disk.
 
 ---
 
+## Baseline numbers — GGUF per model
+
+Two anchors per model so you can see what streaming costs over stock
+and what prefetch-temporal buys over no-prefetch.
+
+### Stock (all-resident, smoke-test — short prompt, n_predict 7-8)
+
+Measures kernel-warm throughput with no sidecar streaming. Decode numbers
+are inflated vs sustained 300-token generation because the model hasn't
+saturated cache churn. Useful as an upper-bound reference.
+
+| Model | Quant | Prompt ms | Prompt tok/s | Decode tok/s | Decode ms/token |
+|-------|-------|----------:|-------------:|-------------:|----------------:|
+| Qwen3.6-35B-A3B  | Q4_K_XL  |  805.03 |  24.84 | 63.65 | 15.71 |
+| Qwen3.5-35B-A3B  | Q5_K_M   |   95.84 | 208.67 | 68.42 | 14.61 |
+| Gemma-4-26B-A4B  | Q8_K_XL  |  204.42 | 102.73 | 23.45 | 42.64 |
+
+### Streaming baseline (slot-bank, **no** prefetch — Phase 2A axis2-pf0, 4 prompts, n_predict 300)
+
+The "what does slot-bank streaming cost without any prefetch help" anchor.
+This is the point from which `--moe-prefetch-temporal` and all other
+optimizations were measured.
+
+| Model | Quant | Decode tok/s | TTFT  | RSS   |
+|-------|-------|-------------:|-----:|------:|
+| Qwen3.6-35B-A3B  | Q4_K_XL  | 15.03 | 2.74 s | 4.40 GB |
+| Qwen3.5-35B-A3B  | Q5_K_M   |  9.06 | 4.04 s | 4.42 GB |
+| Gemma-4-26B-A4B  | Q8_K_XL  |  4.08 | 4.62 s | 7.07 GB |
+
+### Streaming best (Phase 2B factorial sweet spot, 4 prompts, n_predict 300)
+
+The "what does the best validated streaming config give" anchor. This
+is what production should ship for each model, modulo the Phase 2C
+quality gate (done for Qwen3.6 Q4 only; pending for Q5 and Gemma-4
+under rerun345).
+
+| Model | Quant | Config | Decode tok/s | TTFT  | RSS   | vs no-prefetch |
+|-------|-------|--------|-------------:|-----:|------:|---------------:|
+| Qwen3.6-35B-A3B  | Q4_K_XL  | p2b-13 (ctx+sb+temporal) | **23.41** | 1.18 s | 4.55 GB | +56 % decode, 2.3× faster TTFT |
+| Qwen3.5-35B-A3B  | Q5_K_M   | p2b-21 (ctx+sb+temporal) | **23.34** | 1.18 s | 4.22 GB | +158 % decode, 3.4× faster TTFT |
+| Gemma-4-26B-A4B  | Q8_K_XL  | axis-5 ctx=16384 (axis-1 sweep corrupted) | **16.34** | 0.96 s | 6.84 GB | +300 % decode, 4.8× faster TTFT |
+
+**Finding on the Q5/Gemma-4 lift:** The prefetch-temporal + factorial
+sweet spot is roughly 2-4× the no-prefetch baseline on these models,
+and on Q5_K_M it brings performance essentially equal to Q4_K_XL
+(23.34 vs 23.41 tok/s) — the extra bytes of Q5 per token don't
+materially hurt once prefetch keeps the pipeline busy.
+
+---
+
 ## Cross-engine: GGUF vs MLX on the same model
 
 All below are Qwen3.6-35B-A3B on 48 GB M4 Max.
