@@ -94,7 +94,11 @@ def run_for_model(model_key: str, prompts: list[dict], out_dir: Path,
         print(f"[{model_key}] nothing to do — {out_path} is complete")
         return out_path
 
-    client = anthropic.Anthropic()  # auto-reads ANTHROPIC_API_KEY
+    # Strip whitespace/newlines from the API key. Some shells or .env loaders
+    # leave a trailing '\n' that curl tolerates but httpx rejects as an
+    # illegal header value ("LocalProtocolError: Illegal header value").
+    api_key = os.environ["ANTHROPIC_API_KEY"].strip()
+    client = anthropic.Anthropic(api_key=api_key)
 
     # Append each record as soon as it's done (line-buffered) so a kill/crash
     # preserves everything up to that point — matches resume logic above.
