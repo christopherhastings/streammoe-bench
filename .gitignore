@@ -9,6 +9,8 @@ __pycache__/
 .claude/
 CLAUDE.md
 
-# StreamMoE app lives in its own repo (christopherhastings/streammoe-app);
-# keep its tree out of this repo entirely to avoid a phantom submodule.
-streammoe-app/
+# Swift build output — binaries, not source
+streammoe-app/.build/
+streammoe-app/.swiftpm/
+streammoe-app/Package.resolved
+streammoe-app/build/
