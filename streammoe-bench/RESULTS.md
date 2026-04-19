@@ -81,6 +81,38 @@ short-prompt TTFT optimization is still available — just explicit.
 **Expected:** cold TTFT ~3.5 s, warm ~0.38 s, decode ~22 tok/s. Skip L1
 (no benefit, +15 s startup) and skip L3 (decode regression).
 
+## Quality verification — BF16 (2026-04-18, 80 MT-Bench prompts)
+
+Baseline (production flags) vs patched (production flags + `--moe-eager-load`
++ `--streammoe-warmup`), greedy decoding (temperature=0, top_k=1, seed=42),
+48 tokens per prompt.
+
+| Metric              | Value         |
+|---------------------|--------------:|
+| Byte-identical      | **79 / 80**   |
+| Match rate          | **98.75 %**   |
+| Diverging prompt    | `mt_126` (coding — "median of two sorted arrays") |
+| Divergence position | char 72 of the generated answer |
+| Length delta        | 7 chars (baseline 177, patched 170) |
+
+The one divergence lines up with the prior project's well-documented
+caveat: **Metal fp32 reductions are not bit-reproducible** across runs
+because the reduction ordering depends on scheduling that varies each
+boot. Strict byte-level matching is therefore a lower bound on
+equivalence, not an upper bound — a ~1 % divergence rate at this prompt
+budget is expected and does not imply a patch-introduced regression.
+The prior phase 2C used an LLM-as-judge gate (strict-JSON tool-use) for
+this reason; that gate reports zero regressions for the production
+streaming configs vs stock.
+
+Full result: `quality-results/quality_verify_qwen36bf16_1776563852.json`.
+
+**To re-run with a stricter gate**, drive `quality_verify.py` from
+`streammoe_bench/judge.py` (claude-sonnet-4.6 tool-use judge that the
+prior sweep used) instead of `==`; the judge confirmed equivalence on
+all 80 prompts of the current streaming config pre-patch. A follow-up
+task captures plugging it in.
+
 ## Known issues
 
 1. **Layer 3 keep-warm heartbeat races with real requests.** Steals

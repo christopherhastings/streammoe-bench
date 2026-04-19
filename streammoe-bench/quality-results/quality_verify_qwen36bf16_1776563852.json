@@ -1,0 +1,17 @@
+{
+  "generated_at": 1776555321.5639832,
+  "model": "qwen36bf16",
+  "model_label": "Qwen3.6-35B-A3B-BF16",
+  "n_prompts": 80,
+  "n_predict": 48,
+  "binary": "/Users/claude/streammoe/anemll-flash-llama.cpp/build/bin/llama-server",
+  "matches": 79,
+  "mismatches": [
+    {
+      "idx": 45,
+      "diverge_at": 72,
+      "baseline_len": 177,
+      "patched_len": 170
+    }
+  ]
+}
