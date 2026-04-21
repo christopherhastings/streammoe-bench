@@ -296,6 +296,40 @@ Need sub-second TTFT and only chat (no STEM/coding/math)?
 4. Post-patch claude-judge on the BF16 1/80 divergence.
 5. Fresh bench confirming Layer 3 keep-warm race fix.
 
+### In-flight (2026-04-19/20)
+
+Cross-model quality matrix — 5 locally-run configs × 2 frontier
+references, same 80 MT-Bench prompts:
+
+| Local config    | Model · Quant · Loading                       | Status |
+|-----------------|-----------------------------------------------|--------|
+| q4_resident     | Qwen3.6-35B-A3B Q4_K_XL · stock resident      | sampled ✓ (80/80) |
+| q4_streaming    | Qwen3.6-35B-A3B Q4_K_XL · slot-bank sb=256    | sampled ✓ (80/80) |
+| bf16_streaming  | Qwen3.6-35B-A3B BF16 · slot-bank sb=128       | sampled ✓ (80/80) |
+| qwen35_9b       | Qwen3.5-9B Q4_K_M · dense resident            | downloaded ✓, sampling pending |
+| qwen35_122b     | Qwen3.5-122B-A10B UD-Q4_K_XL · slot-bank 128  | downloaded + sidecar extracted ✓, sampling pending |
+
+References: Claude Haiku 4.5 + Claude Sonnet 4.6, both captured (80 each).
+
+Three fixes shipped 2026-04-20 against the overnight crash from the
+first judge run:
+- `quality_compare.py` n_predict 1024 → 3000 (Qwen3 `<think>` blocks
+  were consuming the whole budget on ~20/80 prompts).
+- `judge_vs_references.py` strips `<think>…</think>` before judging +
+  surfaces all-think-no-answer as a `no_answer` verdict.
+- Judge resumability: per-prompt checkpoint, rerun skips done IDs.
+- Bonus: `ANTHROPIC_API_KEY.strip()` so a trailing `\n` doesn't turn
+  every judge call into a LocalProtocolError (which is what killed
+  the overnight built-in judge phase).
+
+Local-judge fallback: `--judge-endpoint http://localhost:1234/v1`
+routes to LM Studio (or any OpenAI-compat endpoint) so the cross-judge
+run can stay off the Anthropic API when desired.
+
+Ready to kick off the remaining sampling + full judge matrix when the
+GPU is free and the user signs off on the API cost (~$2-4 on Claude or
+$0 on LM Studio).
+
 ---
 
 ## Source files
