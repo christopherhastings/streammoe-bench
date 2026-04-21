@@ -252,6 +252,84 @@ class TestQ4StreamingSb128Config:
                 == QUALITY_CONFIGS["q4_streaming"]["model_key"])
 
 
+class TestComputeDecodeTps:
+    """The bug: decode_tps was computed as
+        n_tok / max(wall_s - ttft_s, 1e-6)
+    where wall_s is the client round-trip and ttft_s is the server's
+    timings.prompt_ms. Those are different clocks and different scopes
+    (server sees async prefetch; client doesn't). When ttft_s >= wall_s
+    the subtraction goes ≤ 0, gets clamped to 1e-6, and decode_tps
+    explodes to hundreds of millions of tok/s. Observed 1/80 times in
+    the sb=128 run (mt_108: 359,000,000 tok/s).
+
+    Fix: prefer the server's own self-consistent decode timer
+    (timings.predicted_ms / predicted_n), fall back to the client-wall
+    math only when the server didn't provide those fields, and REJECT
+    nonsensical denominators instead of clamping them.
+    """
+
+    def test_normal_case_uses_wall_math(self):
+        """Client wall is ground truth. Empty timings dict is fine."""
+        from ttft_bench import compute_decode_tps
+        # 100 tokens / (10s - 2s) = 12.5 tok/s
+        assert compute_decode_tps({}, n_tok=100,
+                                  wall_s=10.0, ttft_s=2.0) == 12.5
+
+    def test_returns_zero_when_denominator_nonpositive(self):
+        """The mt_108 case: ttft > wall (server prompt_ms counted async
+        prefetch that happened in parallel). Return 0 instead of
+        359_000_000 so the bad sample is obvious downstream."""
+        from ttft_bench import compute_decode_tps
+        assert compute_decode_tps({}, n_tok=359,
+                                  wall_s=16.3, ttft_s=20.1) == 0.0
+
+    def test_returns_zero_when_denominator_tiny(self):
+        """Avoid the 1e-6 clamp-then-divide antipattern."""
+        from ttft_bench import compute_decode_tps
+        assert compute_decode_tps({}, n_tok=359,
+                                  wall_s=16.295, ttft_s=16.290) == 0.0
+
+    def test_returns_zero_when_n_tok_zero(self):
+        from ttft_bench import compute_decode_tps
+        assert compute_decode_tps({}, n_tok=0, wall_s=5.0, ttft_s=1.0) == 0.0
+
+    def test_ignores_server_timings_when_they_disagree_with_wall(self):
+        """Key finding from this fork's bf16 streaming runs:
+           server `predicted_ms` routinely overcounts by ~5-10x because
+           it includes async expert-prefetch blocking time on sibling
+           slots. Example: for 2378 tokens with client wall=245s, the
+           server reported predicted_ms=1,213,000 → 1.96 tok/s. That's
+           physically impossible on a 245s wall. Client wall is the only
+           clock we can trust for this fork.
+        """
+        from ttft_bench import compute_decode_tps
+        # Server says 1.96 tok/s, client wall math says ~10 tok/s.
+        # We MUST take the wall-math answer here.
+        timings = {"predicted_n": 2378, "predicted_ms": 1_213_000}
+        result = compute_decode_tps(timings, n_tok=2378,
+                                    wall_s=245.29, ttft_s=9.46)
+        # Wall math: 2378 / (245.29 - 9.46) = 10.08 tok/s
+        assert abs(result - 10.08) < 0.1
+
+    def test_integration_mt108_returns_zero(self):
+        """Real mt_108 numbers: wall=16.295, ttft=20.121, n_tok=359.
+        Not 359e6. Not the bogus server timer. Just 0.
+        """
+        from ttft_bench import compute_decode_tps
+        assert compute_decode_tps({}, n_tok=359,
+                                  wall_s=16.295, ttft_s=20.121) == 0.0
+
+    def test_integration_normal_prompt_unchanged(self):
+        """mt_112 numbers from the same run: should produce the same
+        answer as the original formula for any prompt where the server
+        and client clocks agreed."""
+        from ttft_bench import compute_decode_tps
+        result = compute_decode_tps({}, n_tok=395,
+                                    wall_s=17.806, ttft_s=2.519)
+        # 395 / (17.806 - 2.519) = 395 / 15.287 = 25.84 tok/s
+        assert abs(result - 25.84) < 0.01
+
+
 class TestClearKVCache:
     """Between prompts the server's KV cache must be reset so each prompt
     is measured against a fresh context — otherwise earlier responses

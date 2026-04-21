@@ -617,6 +617,40 @@ def is_model_loaded(model_id: str, loaded_models: list) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+# Minimum plausible denominator for the wall-math fallback (seconds). Below
+# this we treat the measurement as unreliable and return 0 rather than
+# emitting a garbage-looking number like "359,000,000 tok/s". 10 ms covers
+# any realistic per-batch jitter without swallowing real fast-decode cases.
+_DECODE_TPS_DENOM_MIN_S = 0.01
+
+
+def compute_decode_tps(timings: dict, n_tok: int,
+                       wall_s: float, ttft_s: float) -> float:
+    """Client-wall-math tokens-per-second for the decode phase.
+
+    Formula: `n_tok / (wall_s - ttft_s)`. Server-side `timings.predicted_ms`
+    is accepted as an argument for call-site symmetry and for future
+    validation use, but is **not** used to compute the rate. On the
+    slot-bank fork the server timer has been observed to drift badly
+    (e.g. reporting 1,213 s of decode inside a 245 s request), so we
+    treat client wall as ground truth.
+
+    When `wall_s - ttft_s` is ≤ 0 or below `_DECODE_TPS_DENOM_MIN_S` we
+    return 0.0 rather than a huge number. That surfaces the bad sample
+    to the caller (e.g. mt_108-style races where ttft_s > wall_s due to
+    client/server clock scope mismatch) instead of silently polluting
+    aggregate stats.
+    """
+    del timings  # kept in signature for call-site symmetry; see docstring
+    if not n_tok:
+        return 0.0
+
+    denom = wall_s - ttft_s
+    if denom < _DECODE_TPS_DENOM_MIN_S:
+        return 0.0
+    return n_tok / denom
+
+
 def clear_kv_cache(port: int, session) -> None:
     """Tell llama-server to drop its KV cache between prompts.
 
@@ -676,7 +710,7 @@ def collect_quality_response(session, port: int, prompt_id: str,
     timings = data.get("timings") or {}
     ttft_s = float(timings.get("prompt_ms", 0)) / 1000.0 if timings else 0.0
     wall_s = t_end - t0
-    decode_tps = (n_tok / max(wall_s - ttft_s, 1e-6)) if n_tok else 0.0
+    decode_tps = compute_decode_tps(timings, n_tok, wall_s, ttft_s)
 
     # Clear KV cache between prompts so each one is measured against a
     # fresh context (cross-prompt bleed would make the quality comparison
