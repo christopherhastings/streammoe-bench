@@ -39,6 +39,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -258,6 +259,81 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Per-prompt structured logging + memory pressure
+# --------------------------------------------------------------------------- #
+#
+# Alongside each responses_<config>.json we write a sibling
+# responses_<config>.log.jsonl — one line per prompt — capturing wall time,
+# RSS, decode tok/s, and macOS memory_pressure level. The log is a sidecar
+# so quality_compare-compatible consumers don't see a schema change; when a
+# sampling run goes sideways (OOM, Metal allocation failure, kernel swap
+# thrash), the log is what tells us whether memory pressure preceded it.
+#
+# get_memory_pressure() shells out to the macOS `memory_pressure` tool once
+# per prompt (between prompts, never during generation). The subprocess
+# adds ~50-100 ms so we accept that cost once per prompt rather than
+# polling continuously.
+
+def get_memory_pressure() -> str:
+    """Sample macOS memory pressure level.
+
+    Returns one of normal/warning/critical/unknown. Never raises — a
+    missing `memory_pressure` binary (e.g. on Linux CI) or a stalled
+    subprocess both return "unknown".
+    """
+    try:
+        out = subprocess.check_output(["memory_pressure"], text=True, timeout=5)
+    except Exception:
+        return "unknown"
+    for line in out.splitlines():
+        line = line.lower()
+        if "critical" in line:
+            return "critical"
+        if "warning" in line:
+            return "warning"
+        if "normal" in line:
+            return "normal"
+    return "unknown"
+
+
+def get_log_path(responses_path: Path) -> Path:
+    """responses_bf16_streaming.json  →  responses_bf16_streaming.log.jsonl"""
+    p = Path(responses_path)
+    # with_suffix("") strips .json; then replace with .log.jsonl
+    return p.with_suffix("").with_suffix(".log.jsonl")
+
+
+def build_log_entry(prompt_id: str, wall_s: float, rss_bytes: int | None,
+                    memory_pressure: str, decode_tps: float, n_tokens: int,
+                    timestamp: str | None = None) -> dict:
+    """One structured log row. rss_gib is rounded convenience alongside the
+    raw byte count so a human tailing the log doesn't have to divide."""
+    return {
+        "prompt_id": prompt_id,
+        "wall_s": round(float(wall_s), 3),
+        "rss_bytes": rss_bytes,
+        "rss_gib": round(rss_bytes / 1024**3, 2) if rss_bytes else None,
+        "memory_pressure": memory_pressure,
+        "decode_tps": round(float(decode_tps), 2),
+        "n_tokens": int(n_tokens),
+        "timestamp": timestamp or datetime.utcnow().isoformat(),
+    }
+
+
+def append_log_entry(log_path: Path, entry: dict) -> None:
+    """Append one JSON line to the log file. Never raises — logging must
+    not break the sampling loop."""
+    try:
+        path = Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Qwen3 <think>-block handling
 # --------------------------------------------------------------------------- #
 #
@@ -321,6 +397,7 @@ class QualityResult:
     ttft_s: float
     wall_s: float
     rss_bytes: int | None = None
+    memory_pressure: str | None = None  # macOS memory_pressure at sample time
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -506,14 +583,21 @@ def collect_quality_response(session, port: int, prompt_id: str,
                              category: str, prompt: str,
                              n_predict: int, seed: int,
                              server_pid: int | None = None,
-                             timeout_s: float = 600.0) -> QualityResult:
+                             timeout_s: float = 600.0,
+                             log_path: Path | None = None) -> QualityResult:
     """Fire one prompt at a running llama-server, parse an OpenAI-compatible
     chat-completions response, return a QualityResult.
 
     `session` is a requests-like object with a .post(url, json=..., timeout=...)
     method; the tests use a MagicMock. If `server_pid` is given, sample
     its RSS after the response arrives so the caller can plot memory
-    usage per prompt.
+    usage per prompt. If `log_path` is given, one JSON line per prompt
+    is appended there with {prompt_id, wall_s, rss_bytes, rss_gib,
+    memory_pressure, decode_tps, n_tokens, timestamp}.
+
+    Memory pressure is sampled AFTER the response arrives, i.e. between
+    prompts — never during generation, so the memory_pressure subprocess
+    doesn't compete with the running model for scheduling.
     """
     body = {
         "model": "local",
@@ -543,12 +627,26 @@ def collect_quality_response(session, port: int, prompt_id: str,
     decode_tps = (n_tok / max(wall_s - ttft_s, 1e-6)) if n_tok else 0.0
 
     rss = process_rss_bytes(server_pid) if server_pid else None
+    # Pressure check runs now — after the server response is in hand but
+    # before we return to the sampling loop — so it's between prompts.
+    pressure = get_memory_pressure() if log_path is not None else None
 
-    return QualityResult(
+    result = QualityResult(
         prompt_id=prompt_id, category=category, prompt=prompt,
         content=content, n_tokens=n_tok, decode_tps=decode_tps,
         ttft_s=ttft_s, wall_s=wall_s, rss_bytes=rss,
+        memory_pressure=pressure,
     )
+    if log_path is not None:
+        append_log_entry(log_path, build_log_entry(
+            prompt_id=prompt_id,
+            wall_s=wall_s,
+            rss_bytes=rss,
+            memory_pressure=pressure or "unknown",
+            decode_tps=decode_tps,
+            n_tokens=n_tok,
+        ))
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -1097,6 +1195,14 @@ def run_quality_mode(args) -> int:
         time.sleep(2.0)  # warmup window
 
         results = list(existing_results)
+        log_path = get_log_path(out_path)
+        # Exit-safety: if memory_pressure reports "critical" for three
+        # prompts in a row, stop this cell cleanly with what we've got
+        # rather than risk a kernel-level hang. macOS under sustained
+        # critical memory pressure starts compressing/swapping aggressively
+        # and an M-class Metal workload can wedge the graphics stack.
+        consecutive_critical = 0
+        bailed = False
         try:
             for i, p in enumerate(todo):
                 try:
@@ -1106,6 +1212,7 @@ def run_quality_mode(args) -> int:
                         prompt=p["prompt"],
                         n_predict=n_predict, seed=42,
                         server_pid=proc.pid,
+                        log_path=log_path,
                     )
                     results.append(r)
                 except Exception as e:
@@ -1120,13 +1227,47 @@ def run_quality_mode(args) -> int:
                 # Per-prompt atomic checkpoint.
                 save_quality_responses(results, name, cfg["label"],
                                         load_s, flags, out_path)
+
+                # Memory-pressure watchdog — read pressure off the last
+                # result (collect_quality_response stamped it there).
+                pressure = getattr(results[-1], "memory_pressure", None)
+                if pressure == "critical":
+                    consecutive_critical += 1
+                    print(f"  [WARN] memory pressure: critical at "
+                          f"{results[-1].prompt_id} "
+                          f"(streak {consecutive_critical})",
+                          flush=True)
+                elif pressure == "warning":
+                    consecutive_critical = 0
+                    print(f"  [WARN] memory pressure: warning at "
+                          f"{results[-1].prompt_id}", flush=True)
+                else:
+                    consecutive_critical = 0
+
+                if consecutive_critical >= 3:
+                    print(f"  [ABORT] {name}: memory_pressure=critical on "
+                          f"3 consecutive prompts — stopping this cell "
+                          f"cleanly at {len(results)}/{len(prompts)} to "
+                          f"avoid a kernel freeze. Re-run later (it's "
+                          f"resumable).", flush=True)
+                    bailed = True
+                    break
+
                 if (i + 1) % 10 == 0 or (i + 1) == len(todo):
                     last = results[-1]
                     print(f"  {name} {len(results)}/{len(prompts)}  "
                           f"last: n_tok={last.n_tokens} "
-                          f"wall={last.wall_s:.1f}s", flush=True)
+                          f"wall={last.wall_s:.1f}s "
+                          f"press={last.memory_pressure}", flush=True)
         finally:
             stop_server(proc)
+        if bailed:
+            # Skip remaining configs — the whole machine is under memory
+            # pressure, not just this config. User can rerun with --only
+            # for the remaining ones after freeing memory.
+            print(f"\n[abort] stopping further configs; rerun after "
+                  f"pressure subsides.", flush=True)
+            return 0
 
     print(f"\nquality responses written under {out_dir}")
     return 0

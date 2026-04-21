@@ -161,6 +161,72 @@ class TestLoadCompletedPromptIds:
         assert load_completed_prompt_ids(f) == {"mt_81", "mt_82"}
 
 
+class TestPerPromptLogging:
+    def test_log_file_created_alongside_responses(self, tmp_path):
+        from ttft_bench import get_log_path
+        responses_path = tmp_path / "responses_bf16_streaming.json"
+        log_path = get_log_path(responses_path)
+        assert log_path == tmp_path / "responses_bf16_streaming.log.jsonl"
+
+    def test_log_entry_has_required_fields(self):
+        from ttft_bench import build_log_entry
+        entry = build_log_entry(
+            prompt_id="mt_81",
+            wall_s=4.2,
+            rss_bytes=24_000_000_000,
+            memory_pressure="normal",
+            decode_tps=18.3,
+            n_tokens=120,
+            timestamp="2026-04-20T21:00:00",
+        )
+        assert entry["prompt_id"] == "mt_81"
+        assert entry["wall_s"] == 4.2
+        assert entry["rss_bytes"] == 24_000_000_000
+        assert entry["memory_pressure"] in ("normal", "warning", "critical", "unknown")
+        assert entry["decode_tps"] == 18.3
+        assert entry["n_tokens"] == 120
+        assert "timestamp" in entry
+
+    def test_log_entry_written_atomically(self, tmp_path):
+        from ttft_bench import append_log_entry, build_log_entry, get_log_path
+        responses_path = tmp_path / "responses_test.json"
+        log_path = get_log_path(responses_path)
+        entry = build_log_entry(
+            "mt_81", 4.2, 24_000_000_000, "normal", 18.3, 120,
+            "2026-04-20T21:00:00",
+        )
+        append_log_entry(log_path, entry)
+        assert log_path.exists()
+        lines = log_path.read_text().strip().split("\n")
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["prompt_id"] == "mt_81"
+
+    def test_multiple_entries_appended(self, tmp_path):
+        from ttft_bench import append_log_entry, build_log_entry, get_log_path
+        responses_path = tmp_path / "responses_test.json"
+        log_path = get_log_path(responses_path)
+        for i, pid in enumerate(["mt_81", "mt_82", "mt_83"]):
+            entry = build_log_entry(
+                pid, float(i), 24_000_000_000, "normal", 18.3, 10,
+                "2026-04-20T21:00:00",
+            )
+            append_log_entry(log_path, entry)
+        lines = log_path.read_text().strip().split("\n")
+        assert len(lines) == 3
+
+    def test_get_memory_pressure_returns_valid_level(self):
+        from ttft_bench import get_memory_pressure
+        level = get_memory_pressure()
+        assert level in ("normal", "warning", "critical", "unknown")
+
+    def test_get_memory_pressure_does_not_raise(self):
+        from ttft_bench import get_memory_pressure
+        # Should never raise — returns "unknown" on any error
+        level = get_memory_pressure()
+        assert isinstance(level, str)
+
+
 class TestQualityModeCLI:
     def test_mode_quality_cli_flag_exists(self):
         from ttft_bench import build_arg_parser
