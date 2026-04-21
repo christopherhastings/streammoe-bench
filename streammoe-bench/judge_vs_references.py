@@ -79,6 +79,76 @@ def is_no_answer(raw: str) -> bool:
     return bool(raw.strip()) and not strip_think(raw)
 
 
+def judge_pair_local(client, prompt, ref_content, local_content, model,
+                     retries: int = 2) -> dict:
+    """Judge a pair via an OpenAI-compatible local endpoint (e.g. LM Studio).
+
+    Mirrors streammoe_bench.quality_gates.judge_pair but uses the OpenAI
+    chat/completions tool-use shape instead of Anthropic's. Use when the
+    user wants to stay off the Anthropic API (cost, rate limits, offline)
+    and run a local LLM as the judge instead.
+
+    Retry-with-exponential-backoff on any exception; returns parse_error
+    verdict if the model never emits a tool call."""
+    sys_p = (
+        "You are an expert judge evaluating LLM response quality. "
+        "Given a prompt and two responses — Reference and Test — judge whether "
+        "the Test answer is equivalent in quality to the Reference. "
+        "Focus on correctness, completeness, and usefulness. "
+        "Ignore length and formatting differences. "
+        "You must call the submit_verdict function with your verdict."
+    )
+    user_msg = (
+        f"PROMPT:\n{prompt}\n\n"
+        f"REFERENCE:\n{ref_content[:1200]}\n\n"
+        f"TEST:\n{local_content[:1200]}"
+    )
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "submit_verdict",
+            "description": "Submit quality verdict",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["same", "similar", "different"],
+                        "description":
+                            "same=equivalent quality, "
+                            "similar=minor differences, "
+                            "different=meaningful quality gap"
+                    },
+                    "reasoning": {"type": "string"},
+                },
+                "required": ["verdict", "reasoning"],
+            },
+        },
+    }
+    for attempt in range(retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": sys_p},
+                    {"role": "user",   "content": user_msg},
+                ],
+                tools=[tool],
+                tool_choice={"type": "function",
+                             "function": {"name": "submit_verdict"}},
+                max_tokens=300,
+                temperature=0,
+            )
+            for choice in resp.choices:
+                if choice.message.tool_calls:
+                    return json.loads(choice.message.tool_calls[0].function.arguments)
+        except Exception as e:
+            if attempt == retries:
+                return {"verdict": "parse_error", "reasoning": str(e)}
+            time.sleep(2 ** attempt)
+    return {"verdict": "parse_error", "reasoning": "exhausted retries"}
+
+
 def load_local_responses(compare_dir: Path, name: str) -> dict[str, dict]:
     path = compare_dir / f"responses_{name}.json"
     if not path.exists():
@@ -114,13 +184,17 @@ def load_prompts(prompts_file: Path) -> dict[str, dict]:
 
 
 def judge_pair_set(client, local_name, ref_name, local_responses,
-                   ref_responses, prompts, judge_model, out_path) -> dict:
+                   ref_responses, prompts, judge_model, out_path,
+                   use_local: bool = False) -> dict:
     """Judge every prompt where BOTH local and ref produced output.
 
     Resumable: if `out_path` already exists from a previous run, we load
     the partial results and skip prompts that have a verdict. The full
     result is re-written to disk after every prompt, so killing the
     process loses at most the verdict that was in-flight at the moment.
+
+    use_local=True routes to judge_pair_local (OpenAI-compatible endpoint
+    like LM Studio); use_local=False uses the hosted Claude judge.
     """
     from streammoe_bench.quality_gates import judge_pair
 
@@ -188,8 +262,12 @@ def judge_pair_set(client, local_name, ref_name, local_responses,
         else:
             stripped_local = strip_think(raw_local)
             # "stock" = reference model; "sidecar" = our local model.
-            v = judge_pair(client, prompt, ref["content"], stripped_local,
-                           model=judge_model)
+            if use_local:
+                v = judge_pair_local(client, prompt, ref["content"],
+                                     stripped_local, model=judge_model)
+            else:
+                v = judge_pair(client, prompt, ref["content"], stripped_local,
+                               model=judge_model)
 
         counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
         bc = by_category.setdefault(category or "unknown", dict(EMPTY_COUNTS))
@@ -225,18 +303,41 @@ def main() -> int:
     ap.add_argument("--prompts", default="mtbench80.jsonl")
     ap.add_argument("--output-dir", default="./quality-results/compare")
     ap.add_argument("--judge-model", default="claude-sonnet-4-6")
+    ap.add_argument("--judge-endpoint", default=None,
+                    help="OpenAI-compatible base URL for a local judge "
+                         "(e.g. http://localhost:1234/v1 for LM Studio). "
+                         "If set, bypasses the Anthropic API entirely — "
+                         "--judge-model must be the local model's id.")
+    ap.add_argument("--judge-api-key", default="lm-studio",
+                    help="API key for the local judge endpoint (default: "
+                         "'lm-studio'; most local servers ignore the value).")
     ap.add_argument("--locals", default=",".join(LOCAL_CONFIGS))
     ap.add_argument("--refs",   default=",".join(REFERENCES))
     args = ap.parse_args()
 
-    try:
-        import anthropic
-    except ImportError:
-        print("[fatal] pip install anthropic", file=sys.stderr); return 2
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        print("[fatal] ANTHROPIC_API_KEY not set", file=sys.stderr); return 2
-    client = anthropic.Anthropic(api_key=api_key)
+    if args.judge_endpoint:
+        # Local OpenAI-compatible endpoint (e.g. LM Studio) — bypass Anthropic.
+        try:
+            from openai import OpenAI
+        except ImportError:
+            print("[fatal] pip install openai  (needed for --judge-endpoint)",
+                  file=sys.stderr); return 2
+        client = OpenAI(base_url=args.judge_endpoint, api_key=args.judge_api_key)
+        use_local = True
+        print(f"[judge] local endpoint: {args.judge_endpoint}  model: {args.judge_model}",
+              flush=True)
+    else:
+        try:
+            import anthropic
+        except ImportError:
+            print("[fatal] pip install anthropic", file=sys.stderr); return 2
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not api_key:
+            print("[fatal] ANTHROPIC_API_KEY not set "
+                  "(or use --judge-endpoint for local judge)", file=sys.stderr)
+            return 2
+        client = anthropic.Anthropic(api_key=api_key)
+        use_local = False
 
     compare_dir = Path(args.compare_dir)
     ref_dir     = Path(args.ref_dir)
@@ -272,6 +373,7 @@ def main() -> int:
                 locals_data[ln], refs_data[rn],
                 prompts, args.judge_model,
                 out_path,
+                use_local=use_local,
             )
             grid.append(result)
 
