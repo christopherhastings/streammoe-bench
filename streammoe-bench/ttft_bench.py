@@ -274,26 +274,47 @@ def _atomic_write_text(path: Path, text: str) -> None:
 # adds ~50-100 ms so we accept that cost once per prompt rather than
 # polling continuously.
 
-def get_memory_pressure() -> str:
-    """Sample macOS memory pressure level.
+def _parse_memory_pressure_output(output: str) -> str:
+    """Parse macOS `memory_pressure` stdout → normal/warning/critical/unknown.
 
-    Returns one of normal/warning/critical/unknown. Never raises — a
-    missing `memory_pressure` binary (e.g. on Linux CI) or a stalled
-    subprocess both return "unknown".
+    The tool does NOT emit the words normal/warning/critical. It emits
+    a line of the form:
+        System-wide memory free percentage: 39%
+    among several pages of stats. We read the free-percentage line and
+    bucket by:
+        >= 20% free  -> normal
+        10-19% free  -> warning
+        <  10% free  -> critical
+    Returns "unknown" when the expected line is absent or unparseable.
+    """
+    needle = "System-wide memory free percentage:"
+    for line in output.splitlines():
+        if needle in line:
+            try:
+                pct = int(line.split(":", 1)[1].strip().rstrip("%"))
+            except (ValueError, IndexError):
+                return "unknown"
+            if pct >= 20:
+                return "normal"
+            if pct >= 10:
+                return "warning"
+            return "critical"
+    return "unknown"
+
+
+def get_memory_pressure() -> str:
+    """Sample macOS memory pressure via free percentage.
+
+    Delegates parsing to _parse_memory_pressure_output so tests can hit
+    the logic directly without shelling out. Never raises — a missing
+    `memory_pressure` binary (e.g. on Linux CI) or a stalled subprocess
+    both return "unknown".
     """
     try:
         out = subprocess.check_output(["memory_pressure"], text=True, timeout=5)
     except Exception:
         return "unknown"
-    for line in out.splitlines():
-        line = line.lower()
-        if "critical" in line:
-            return "critical"
-        if "warning" in line:
-            return "warning"
-        if "normal" in line:
-            return "normal"
-    return "unknown"
+    return _parse_memory_pressure_output(out)
 
 
 def get_log_path(responses_path: Path) -> Path:

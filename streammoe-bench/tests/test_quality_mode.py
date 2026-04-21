@@ -227,6 +227,42 @@ class TestPerPromptLogging:
         assert isinstance(level, str)
 
 
+class TestGetMemoryPressure:
+    """Parse the actual `memory_pressure` output format.
+
+    macOS doesn't emit the words 'normal'/'warning'/'critical' — it emits
+    'System-wide memory free percentage: N%'. The pre-hotfix parser was
+    looking for the words directly and never matched, producing
+    "unknown" on every sample. Thresholds:
+      >= 20% free  -> normal
+      10-19% free  -> warning
+      <  10% free  -> critical
+    """
+
+    def test_parses_normal(self):
+        from ttft_bench import _parse_memory_pressure_output
+        output = "System-wide memory free percentage: 40%"
+        assert _parse_memory_pressure_output(output) == "normal"
+
+    def test_parses_warning(self):
+        from ttft_bench import _parse_memory_pressure_output
+        output = "System-wide memory free percentage: 15%"
+        assert _parse_memory_pressure_output(output) == "warning"
+
+    def test_parses_critical(self):
+        from ttft_bench import _parse_memory_pressure_output
+        output = "System-wide memory free percentage: 5%"
+        assert _parse_memory_pressure_output(output) == "critical"
+
+    def test_returns_unknown_on_missing_line(self):
+        from ttft_bench import _parse_memory_pressure_output
+        assert _parse_memory_pressure_output("some other output") == "unknown"
+
+    def test_returns_unknown_on_empty(self):
+        from ttft_bench import _parse_memory_pressure_output
+        assert _parse_memory_pressure_output("") == "unknown"
+
+
 class TestQualityModeCLI:
     def test_mode_quality_cli_flag_exists(self):
         from ttft_bench import build_arg_parser
