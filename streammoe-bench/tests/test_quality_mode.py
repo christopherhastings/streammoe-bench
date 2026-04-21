@@ -227,6 +227,52 @@ class TestPerPromptLogging:
         assert isinstance(level, str)
 
 
+class TestQ4StreamingSb128Config:
+    """Fourth quality config: Q4_K_XL streaming at sb=128 for the honest
+    sustained-workload RAM comparison (sb=256 saturates at ~21 GiB; sb=128
+    targets ~11 GiB at a modest throughput cost)."""
+
+    def test_config_registered(self):
+        from ttft_bench import QUALITY_CONFIGS
+        assert "q4_streaming_sb128" in QUALITY_CONFIGS
+
+    def test_flags_contain_sb128(self):
+        from ttft_bench import QUALITY_CONFIGS
+        mock_model = MagicMock()
+        mock_model.sidecar_dir = Path("/tmp/sidecar")
+        flag_builder = QUALITY_CONFIGS["q4_streaming_sb128"]["flags"]
+        flags = flag_builder(mock_model)
+        assert "--moe-slot-bank" in flags
+        idx = flags.index("--moe-slot-bank")
+        assert flags[idx + 1] == "128"
+
+    def test_uses_same_model_as_other_q4(self):
+        from ttft_bench import QUALITY_CONFIGS
+        assert (QUALITY_CONFIGS["q4_streaming_sb128"]["model_key"]
+                == QUALITY_CONFIGS["q4_streaming"]["model_key"])
+
+
+class TestClearKVCache:
+    """Between prompts the server's KV cache must be reset so each prompt
+    is measured against a fresh context — otherwise earlier responses
+    bleed into the attention history and make cross-prompt quality
+    incomparable."""
+
+    def test_calls_cache_clear_endpoint(self):
+        from ttft_bench import clear_kv_cache
+        mock_session = MagicMock()
+        clear_kv_cache(11500, mock_session)
+        mock_session.post.assert_called_once_with(
+            "http://127.0.0.1:11500/cache/clear", timeout=5
+        )
+
+    def test_does_not_raise_on_failure(self):
+        from ttft_bench import clear_kv_cache
+        mock_session = MagicMock()
+        mock_session.post.side_effect = Exception("connection refused")
+        clear_kv_cache(11500, mock_session)  # must not raise
+
+
 class TestGetMemoryPressure:
     """Parse the actual `memory_pressure` output format.
 

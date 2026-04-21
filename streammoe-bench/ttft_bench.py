@@ -174,6 +174,20 @@ def _bf16_streaming_flags(model):
     ]
 
 
+def _q4_streaming_sb128_flags(model):
+    # Same Q4 model as q4_streaming but with slot-bank 128 instead of 256.
+    # This is the honest sustained-workload RAM datapoint: sb=256 saturates
+    # at ~21 GiB (no real win vs stock's 21.5 GiB), sb=128 targets ~11 GiB
+    # at a modest throughput cost. Cross-judged against haiku + sonnet so
+    # we can tell whether the smaller bank trades quality for RAM or both.
+    return [
+        "--moe-sidecar", str(model.sidecar_dir),
+        "--moe-mode", "slot-bank", "--moe-slot-bank", "128",
+        "--moe-prefetch-temporal",
+        "--flash-attn", "on",
+    ]
+
+
 def _qwen35_9b_resident_flags(model):
     # Dense Q4 — flash-attn only, no sidecar / slot-bank. ~6 GB RAM.
     return ["--flash-attn", "on"]
@@ -190,16 +204,18 @@ def _qwen35_122b_streaming_flags(model):
 
 
 QUALITY_CONFIGS: dict[str, dict] = {
-    "q4_resident":    {"model_key": "qwen36",     "flags": _q4_resident_flags,
-                       "label": "GGUF Q4_K_XL resident (stock)"},
-    "q4_streaming":   {"model_key": "qwen36",     "flags": _q4_streaming_flags,
-                       "label": "GGUF Q4_K_XL slot-bank streaming (sb=256)"},
-    "bf16_streaming": {"model_key": "qwen36bf16", "flags": _bf16_streaming_flags,
-                       "label": "GGUF BF16 slot-bank streaming (sb=128)"},
-    "qwen35_9b":      {"model_key": "qwen35_9b",   "flags": _qwen35_9b_resident_flags,
-                       "label": "Qwen3.5-9B Q4_K_M resident (dense)"},
-    "qwen35_122b":    {"model_key": "qwen35_122b", "flags": _qwen35_122b_streaming_flags,
-                       "label": "Qwen3.5-122B-A10B slot-bank streaming (sb=128)"},
+    "q4_resident":        {"model_key": "qwen36",     "flags": _q4_resident_flags,
+                           "label": "GGUF Q4_K_XL resident (stock)"},
+    "q4_streaming":       {"model_key": "qwen36",     "flags": _q4_streaming_flags,
+                           "label": "GGUF Q4_K_XL slot-bank streaming (sb=256)"},
+    "q4_streaming_sb128": {"model_key": "qwen36",     "flags": _q4_streaming_sb128_flags,
+                           "label": "GGUF Q4_K_XL slot-bank streaming (sb=128)"},
+    "bf16_streaming":     {"model_key": "qwen36bf16", "flags": _bf16_streaming_flags,
+                           "label": "GGUF BF16 slot-bank streaming (sb=128)"},
+    "qwen35_9b":          {"model_key": "qwen35_9b",   "flags": _qwen35_9b_resident_flags,
+                           "label": "Qwen3.5-9B Q4_K_M resident (dense)"},
+    "qwen35_122b":        {"model_key": "qwen35_122b", "flags": _qwen35_122b_streaming_flags,
+                           "label": "Qwen3.5-122B-A10B slot-bank streaming (sb=128)"},
 }
 
 
@@ -600,6 +616,21 @@ def is_model_loaded(model_id: str, loaded_models: list) -> bool:
 # Quality-mode response collection
 # --------------------------------------------------------------------------- #
 
+
+def clear_kv_cache(port: int, session) -> None:
+    """Tell llama-server to drop its KV cache between prompts.
+
+    Each MT-Bench prompt is meant to be measured against a fresh context
+    — otherwise the previous answer's tokens bleed into the attention
+    history and cross-prompt quality becomes incomparable. The endpoint
+    is cheap (~10 ms); failure is non-fatal.
+    """
+    try:
+        session.post(f"http://127.0.0.1:{port}/cache/clear", timeout=5)
+    except Exception:
+        pass  # non-fatal — sampling loop continues
+
+
 def collect_quality_response(session, port: int, prompt_id: str,
                              category: str, prompt: str,
                              n_predict: int, seed: int,
@@ -646,6 +677,11 @@ def collect_quality_response(session, port: int, prompt_id: str,
     ttft_s = float(timings.get("prompt_ms", 0)) / 1000.0 if timings else 0.0
     wall_s = t_end - t0
     decode_tps = (n_tok / max(wall_s - ttft_s, 1e-6)) if n_tok else 0.0
+
+    # Clear KV cache between prompts so each one is measured against a
+    # fresh context (cross-prompt bleed would make the quality comparison
+    # incomparable). Non-fatal on failure.
+    clear_kv_cache(port, session)
 
     rss = process_rss_bytes(server_pid) if server_pid else None
     # Pressure check runs now — after the server response is in hand but
