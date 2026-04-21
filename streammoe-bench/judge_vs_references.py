@@ -28,6 +28,8 @@ they diverge, and where?
 
 from __future__ import annotations
 
+import re
+
 import argparse
 import json
 import os
@@ -40,8 +42,41 @@ if str(STREAMMOE_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(STREAMMOE_PKG_ROOT))
 
 
-LOCAL_CONFIGS = ["q4_resident", "q4_streaming", "bf16_streaming"]
+LOCAL_CONFIGS = ["q4_resident", "q4_streaming", "bf16_streaming",
+                 "qwen35_9b", "qwen35_122b"]
 REFERENCES    = ["haiku", "sonnet"]
+
+
+# --------------------------------------------------------------------------- #
+# Qwen3 <think> handling
+# --------------------------------------------------------------------------- #
+#
+# Qwen3 family models (including the 35B-A3B MoEs and the new 9B / 122B-A10B
+# variants) produce reasoning inside <think>...</think> before the actual
+# answer. The judge should evaluate the post-think answer, not the reasoning
+# trace — otherwise a model that thinks carefully but answers tersely gets
+# graded down on style of its scratchpad instead of its conclusion.
+#
+# Two helpers:
+#   strip_think: remove closed <think>...</think> blocks AND any open
+#                <think>...EOF tail (which happens when the response hits
+#                n_predict mid-thought).
+#   is_no_answer: the response was *all* thinking and produced no post-think
+#                answer. These prompts are surfaced separately in the
+#                verdict distribution rather than fed to the judge with an
+#                empty string — the judge would mark them "different" which
+#                is technically true but doesn't tell you the failure mode.
+
+def strip_think(text: str) -> str:
+    """Remove <think>...</think> blocks and any unclosed <think>...EOF."""
+    text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+    text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
+    return text.strip()
+
+
+def is_no_answer(raw: str) -> bool:
+    """True when the response is all thinking with no actual answer."""
+    return bool(raw.strip()) and not strip_think(raw)
 
 
 def load_local_responses(compare_dir: Path, name: str) -> dict[str, dict]:
@@ -80,44 +115,105 @@ def load_prompts(prompts_file: Path) -> dict[str, dict]:
 
 def judge_pair_set(client, local_name, ref_name, local_responses,
                    ref_responses, prompts, judge_model, out_path) -> dict:
-    """Judge every prompt where BOTH local and ref produced output."""
+    """Judge every prompt where BOTH local and ref produced output.
+
+    Resumable: if `out_path` already exists from a previous run, we load
+    the partial results and skip prompts that have a verdict. The full
+    result is re-written to disk after every prompt, so killing the
+    process loses at most the verdict that was in-flight at the moment.
+    """
     from streammoe_bench.quality_gates import judge_pair
 
+    EMPTY_COUNTS = {"same": 0, "similar": 0, "different": 0,
+                    "no_answer": 0, "parse_error": 0}
+
     common_ids = sorted(set(local_responses) & set(ref_responses))
-    counts = {"same": 0, "similar": 0, "different": 0, "parse_error": 0}
+
+    # Resume from a partial file if present. Skip any prompt_id we've
+    # already judged; re-derive counts from the retained verdicts so a
+    # partial rerun doesn't double-count.
+    done_ids: set[str] = set()
+    counts = dict(EMPTY_COUNTS)
     by_category: dict[str, dict] = {}
     verdicts = []
+    if out_path.exists():
+        try:
+            prior = json.loads(out_path.read_text())
+            for v in prior.get("verdicts", []):
+                if v.get("prompt_id") and "verdict" in v:
+                    done_ids.add(v["prompt_id"])
+                    counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+                    cat = v.get("category") or "unknown"
+                    bc = by_category.setdefault(cat, dict(EMPTY_COUNTS))
+                    bc[v["verdict"]] = bc.get(v["verdict"], 0) + 1
+                    verdicts.append(v)
+            if done_ids:
+                print(f"[resume] {local_name} vs {ref_name}: "
+                      f"{len(done_ids)}/{len(common_ids)} already judged",
+                      flush=True)
+        except Exception as e:
+            print(f"[warn] couldn't resume from {out_path}: {e}", file=sys.stderr)
 
-    print(f"\n=== {local_name} vs {ref_name}  ({len(common_ids)} prompts) ===", flush=True)
+    print(f"\n=== {local_name} vs {ref_name}  "
+          f"({len(common_ids) - len(done_ids)} new, {len(common_ids)} total) ===",
+          flush=True)
+
+    def save():
+        out_path.write_text(json.dumps({
+            "local": local_name, "reference": ref_name,
+            "judge_model": judge_model,
+            "counts": counts, "by_category": by_category,
+            "verdicts": verdicts,
+            "n_compared": len(common_ids),
+        }, indent=2))
+
     t0 = time.monotonic()
     for i, pid in enumerate(common_ids):
+        if pid in done_ids:
+            continue
         local = local_responses[pid]
         ref   = ref_responses[pid]
         prompt = prompts.get(pid, {}).get("prompt") or local.get("prompt") or ref.get("prompt")
         category = prompts.get(pid, {}).get("category") or ref.get("category")
-        # judge_pair is positional: (client, prompt, stock, sidecar).
-        # "stock" = reference model; "sidecar" = our local model.
-        v = judge_pair(client, prompt, ref["content"], local["content"], model=judge_model)
+
+        # Qwen3 produces <think>...</think> before the real answer. Strip
+        # it before judging so the judge sees the answer, not the scratch-
+        # pad. If the response is *all* thinking (n_predict cutoff hit
+        # mid-think), surface "no_answer" instead of feeding an empty
+        # string to the judge.
+        raw_local = local["content"]
+        if is_no_answer(raw_local):
+            v = {"verdict": "no_answer", "score": 0,
+                 "reason": "Model produced only <think> tokens; no actual answer."}
+        else:
+            stripped_local = strip_think(raw_local)
+            # "stock" = reference model; "sidecar" = our local model.
+            v = judge_pair(client, prompt, ref["content"], stripped_local,
+                           model=judge_model)
+
         counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
-        bc = by_category.setdefault(category or "unknown",
-                                    {"same": 0, "similar": 0, "different": 0, "parse_error": 0})
+        bc = by_category.setdefault(category or "unknown", dict(EMPTY_COUNTS))
         bc[v["verdict"]] = bc.get(v["verdict"], 0) + 1
         verdicts.append({"prompt_id": pid, "category": category, **v})
+
+        # Per-prompt checkpoint — a crash now loses at most one judge call.
+        save()
+
         if (i + 1) % 10 == 0:
             dt = time.monotonic() - t0
             print(f"  {local_name} vs {ref_name} {i+1}/{len(common_ids)}  "
                   f"same={counts['same']:2d} sim={counts['similar']:2d} "
-                  f"diff={counts['different']:2d}  ({dt:.0f}s)", flush=True)
+                  f"diff={counts['different']:2d} na={counts['no_answer']:2d}  "
+                  f"({dt:.0f}s)", flush=True)
 
-    result = {
+    save()
+    return {
         "local": local_name, "reference": ref_name,
         "judge_model": judge_model,
         "counts": counts, "by_category": by_category,
         "verdicts": verdicts,
         "n_compared": len(common_ids),
     }
-    out_path.write_text(json.dumps(result, indent=2))
-    return result
 
 
 def main() -> int:
@@ -154,11 +250,21 @@ def main() -> int:
     local_names = [s.strip() for s in args.locals.split(",") if s.strip()]
     ref_names   = [s.strip() for s in args.refs.split(",")   if s.strip()]
 
-    locals_data = {n: load_local_responses(compare_dir, n) for n in local_names}
+    # Gracefully skip locals that don't have a responses file yet (e.g.
+    # qwen35_9b / qwen35_122b before they've been sampled).
+    locals_data = {}
+    for n in local_names:
+        try:
+            locals_data[n] = load_local_responses(compare_dir, n)
+        except FileNotFoundError as e:
+            print(f"[skip local] {n}: {e}", file=sys.stderr)
+
     refs_data   = {n: load_reference(ref_dir, n) for n in ref_names}
 
     grid = []
     for ln in local_names:
+        if ln not in locals_data:
+            continue
         for rn in ref_names:
             out_path = out_dir / f"judge_{ln}_vs_{rn}.json"
             result = judge_pair_set(
@@ -177,13 +283,15 @@ def main() -> int:
         "grid": grid,
     }, indent=2))
     print(f"\nResults: {summary_path}")
-    print(f"\n{'local':20s} {'reference':10s} {'n':>4s} {'same':>5s} {'sim':>5s} {'diff':>5s} {'equiv%':>7s}")
+    print(f"\n{'local':20s} {'reference':10s} {'n':>4s} "
+          f"{'same':>5s} {'sim':>5s} {'diff':>5s} {'na':>4s} {'equiv%':>7s}")
     for r in grid:
         c = r["counts"]
         total = sum(c.values())
-        equiv = c["same"] + c["similar"]
+        equiv = c.get("same", 0) + c.get("similar", 0)
         print(f"{r['local']:20s} {r['reference']:10s} {r['n_compared']:>4d} "
-              f"{c['same']:>5d} {c['similar']:>5d} {c['different']:>5d} "
+              f"{c.get('same',0):>5d} {c.get('similar',0):>5d} "
+              f"{c.get('different',0):>5d} {c.get('no_answer',0):>4d} "
               f"{100*equiv/max(1,total):>7.1f}")
     return 0
 

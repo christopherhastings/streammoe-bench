@@ -2,8 +2,11 @@
 """Multi-config quality comparison on 80 MT-Bench prompts.
 
 Runs each configured server back-to-back against the same 80-prompt
-MT-Bench suite (greedy decoding, seed=42, ctx=8192, n_predict=1024 so
-nothing truncates), saves every full response, then feeds the requested
+MT-Bench suite (greedy decoding, seed=42, ctx=8192, n_predict=3000 so
+nothing truncates — Qwen3 uses <think>...</think> blocks that can
+consume 1k+ tokens before the actual answer starts, so the 1024 budget
+we shipped originally cut off 20-25 % of responses mid-think with no
+final answer), saves every full response, then feeds the requested
 pairwise comparisons to the claude-sonnet-4-6 judge.
 
 Default config set (over Qwen3.6-35B-A3B on the fork at ~/streammoe/...):
@@ -289,7 +292,9 @@ def judge(pair_name: str, a_data: dict, b_data: dict, model: str) -> dict:
         from streammoe_bench.quality_gates import judge_pair
     except ImportError as e:
         return {"pair": pair_name, "error": f"import: {e}"}
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    # .strip() — trailing \n from some shell/env setups makes httpx reject
+    # the header as LocalProtocolError (curl is tolerant; httpx is strict).
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         return {"pair": pair_name, "error": "ANTHROPIC_API_KEY not set"}
     client = anthropic.Anthropic(api_key=api_key)
@@ -329,7 +334,7 @@ def main() -> int:
     ap.add_argument("--output-dir", default="./quality-results/compare")
     ap.add_argument("--prompts", default="mtbench80.jsonl")
     ap.add_argument("--ctx-size", type=int, default=8192)
-    ap.add_argument("--n-predict", type=int, default=1024)
+    ap.add_argument("--n-predict", type=int, default=3000)
     ap.add_argument("--only", default="", help="only run this config (comma list ok)")
     ap.add_argument("--skip-sampling", action="store_true",
                     help="don't spawn servers — re-judge existing responses_*.json")
