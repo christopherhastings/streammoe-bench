@@ -166,6 +166,76 @@ matches user experience.
 
 **Source:** `/Users/claude/streammoe/results/sweep_20260416_230927/phase2c_qwen36_summary.json`
 
+## Cross-model quality matrix (in-flight — 2026-04-20)
+
+Added a second quality experiment layer: **same 80 MT-Bench prompts,
+answered by five locally-run configs AND two frontier references,
+pairwise-judged by Claude sonnet-4-6**. Produces a 5×2 win/tie/loss
+distribution matrix for every local config vs both references.
+
+**Locally-run configs (5):**
+- `q4_resident` — Qwen3.6-35B-A3B Q4_K_XL, stock all-resident
+- `q4_streaming` — Qwen3.6-35B-A3B Q4_K_XL, slot-bank sb=256 streaming
+- `bf16_streaming` — Qwen3.6-35B-A3B BF16, slot-bank sb=128 streaming
+- `qwen35_9b` — Qwen3.5-9B Q4_K_M, dense resident (small-model floor)
+- `qwen35_122b` — Qwen3.5-122B-A10B UD-Q4_K_XL, slot-bank sb=128
+   streaming (48 layers × 256 experts × 10B active)
+
+**Frontier references (2):** Claude Haiku 4.5 + Claude Sonnet 4.6,
+temperature=0 max_tokens=1024, same prompts.
+
+**Status as of 2026-04-20:**
+- All 5 sampling response files for the three 35B configs captured
+  (80 prompts each).
+- Both reference answer files captured (80 × haiku, 80 × sonnet).
+- 9B + 122B sampling pending (GPU was held overnight by the first
+  quality_compare run, which completed sampling but crashed during
+  judge phase — see below).
+- Cross-judge run pending — scripts in place and ready to run.
+
+### Bugs found and fixed (2026-04-20)
+
+Three issues surfaced on the first end-to-end attempt:
+
+1. **Qwen3 `<think>` blocks consumed the 1024-token budget.** Qwen3
+   family models reason inside `<think>...</think>` before the actual
+   answer. On 19-24 of 80 prompts per config, the model spent the
+   entire budget inside the think block and produced no post-think
+   answer. `quality_compare.py` n_predict default raised 1024 → 3000.
+2. **The judge saw raw think tokens.** `judge_vs_references.py` now
+   strips `<think>...</think>` (closed blocks and unclosed-to-EOF tails)
+   before the judge call. All-think responses surface as a new
+   `no_answer` verdict in the distribution, rather than being fed as
+   empty strings to the judge which would grade them "different".
+3. **Judge run wasn't resumable.** A ~30-min run losing all work on
+   a crash was unacceptable. Judge now checkpoints after every verdict
+   (file write per prompt); on rerun it loads the partial, skips
+   already-judged prompt IDs, and re-derives counts from retained
+   verdicts so a partial rerun doesn't double-count.
+
+Bonus fix: API-key handling in `quality_compare.py` now `.strip()`s the
+env value. Overnight the built-in judges crashed with APIConnectionError
+because the user's `ANTHROPIC_API_KEY` had a trailing newline that curl
+tolerates but httpx rejects as an illegal header value. Same fix already
+shipped in `generate_reference_answers.py`.
+
+### Local judge option (LM Studio / vLLM)
+
+`judge_vs_references.py` now also supports a local OpenAI-compatible
+endpoint via `--judge-endpoint`:
+
+```sh
+python3.11 judge_vs_references.py \
+  --judge-endpoint http://localhost:1234/v1 \
+  --judge-model <your-local-model-id>
+```
+
+Bypasses the Anthropic API entirely — use when staying offline or
+avoiding cloud cost/rate-limits, accepting a less-capable judge.
+A second `judge_pair_local()` function mirrors the hosted-judge tool-
+use shape in OpenAI chat/completions form (`submit_verdict` tool with
+same/similar/different enum, forced tool_choice, exp-backoff retries).
+
 ## Reproducing
 
 ```sh
@@ -180,3 +250,24 @@ Bench now imports flags from `/Users/claude/streammoe/streammoe_bench/`
 via `production_config_for(model)` → `build_extra_args()`. If production
 adds a new flag, rerun this bench to pick it up — no ttft_bench.py edit
 needed.
+
+### Cross-model quality comparison
+
+```sh
+# 1. Generate frontier reference answers (Haiku + Sonnet, ~5 min)
+export ANTHROPIC_API_KEY=...
+python3.11 generate_reference_answers.py --concurrency 4
+
+# 2. Sample each local config (stays on GPU while running)
+python3.11 quality_compare.py --only q4_resident       # Qwen3.6 stock
+python3.11 quality_compare.py --only q4_streaming      # Qwen3.6 slot-bank 256
+python3.11 quality_compare.py --only bf16_streaming    # Qwen3.6 BF16 slot-bank 128
+python3.11 quality_compare.py --only qwen35_9b         # Qwen3.5 9B dense
+python3.11 quality_compare.py --only qwen35_122b       # Qwen3.5 122B-A10B slot-bank 128
+
+# 3. Cross-judge all 5 locals × 2 references (resumable)
+python3.11 judge_vs_references.py                       # Claude judge
+python3.11 judge_vs_references.py \                     # or local LM Studio
+  --judge-endpoint http://localhost:1234/v1 \
+  --judge-model your-local-model-id
+```
